@@ -24,6 +24,7 @@
 
 #include <cstdlib>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #ifdef USE_JEMALLOC
 #include "jemalloc/jemalloc.h"
