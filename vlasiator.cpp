@@ -347,6 +347,15 @@ int main(int argn,char* args[]) {
    sysBoundaries.getParameters();
    phiprof::stop("Read parameters");
 
+   //Get version and config info here
+   std::string version;
+   std::string config;
+   //Only master needs the info
+   if (myRank==MASTER_RANK){
+      version=readparameters.versionInfo();
+      config=readparameters.configInfo();
+   }
+
    // Init parallel logger:
    phiprof::start("open logFile & diagnostic");
    //if restarting we will append to logfiles
@@ -548,6 +557,8 @@ int main(int argn,char* args[]) {
             BgBGrid,
             volGrid,
             technicalGrid,
+	    version,
+	    config,
             &outputReducer,P::systemWriteName.size()-1, writeGhosts) == false ) {
          cerr << "FAILED TO WRITE GRID AT " << __FILE__ << " " << __LINE__ << endl;
       }
@@ -726,6 +737,8 @@ int main(int argn,char* args[]) {
                      BgBGrid,
                      volGrid,
                      technicalGrid,
+		     version,
+		     config,
                      &outputReducer, i, writeGhosts) == false ) {
                cerr << "FAILED TO WRITE GRID AT" << __FILE__ << " " << __LINE__ << endl;
             }
@@ -797,6 +810,8 @@ int main(int argn,char* args[]) {
                   BgBGrid,
                   volGrid,
                   technicalGrid,
+		  version,
+		  config,
                   outputReducer,"restart",(uint)P::t, P::restartStripeFactor) == false ) {
             logFile << "(IO): ERROR Failed to write restart!" << endl << writeVerbose;
             cerr << "FAILED TO WRITE RESTART" << endl;

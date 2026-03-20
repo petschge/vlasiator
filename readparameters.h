@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "common.h"
+#include "version.h"
 
 struct Readparameters {
     Readparameters(int argc, char* argv[],MPI_Comm comm);
@@ -59,6 +60,8 @@ struct Readparameters {
     static bool finalize();
     static void helpMessage();
     static bool versionMessage();
+    static std::string versionInfo();
+    static std::string configInfo();
     static bool isInitialized();
     static bool parse(const bool needsRunConfig=true);
    

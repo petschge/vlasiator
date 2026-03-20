@@ -825,7 +825,55 @@ bool writeMeshBoundingBox( Writer & vlsvWriter,
    return success;
 }
 
-/** Writes the mesh metadata for Visit to read FSGrid variable data.
+/*Function to append version information to current output file
+ \param vlsvWriter Some vlsv writer with a file open
+ \param comm MPI comm
+ \return Returns true if operation was successful
+ */
+bool writeVersionInfo(std::string version,vlsv::Writer& vlsvWriter,MPI_Comm comm){
+
+   int myRank;
+   MPI_Comm_rank(comm, &myRank);
+
+   std::map<std::string, std::string> xmlAttributes;
+   xmlAttributes["name"] ="version_information" ;
+
+   bool retval;
+   if( myRank == 0 ) {
+      retval = vlsvWriter.writeArray("VERSION", xmlAttributes, version.size(), 1, &version[0]);
+   }else{
+      retval = vlsvWriter.writeArray("VERSION", xmlAttributes, 0, 1, &version[0]);
+   }
+
+  return retval;
+
+}
+
+/*Function to append config information to current output file
+ \param vlsvWriter Some vlsv writer with a file open
+ \param comm MPI comm
+ \return Returns true if operation was successful
+ */
+bool writeConfigInfo(std::string config,vlsv::Writer& vlsvWriter,MPI_Comm comm){
+
+   int myRank;
+   MPI_Comm_rank(comm, &myRank);
+
+   std::map<std::string, std::string> xmlAttributes;
+   xmlAttributes["name"] ="config_file" ;
+
+   bool retval;
+   if( myRank == 0 ) {
+      retval = vlsvWriter.writeArray("CONFIG", xmlAttributes, config.size(), 1, &config[0]);
+   }else{
+      retval = vlsvWriter.writeArray("CONFIG", xmlAttributes, 0, 1, &config[0]);
+   }
+
+  return retval;
+
+}
+
+ /** Writes the mesh metadata for Visit to read FSGrid variable data.
  * @param technicalGrid An fsgrid instance used to extract metadata info.
  * @param vlsvWriter file object to write into.
  */
@@ -1072,6 +1120,8 @@ bool writeGrid(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
       FsGrid< std::array<Real, fsgrids::bgbfield::N_BGB>, 2>& BgBGrid,
       FsGrid< std::array<Real, fsgrids::volfields::N_VOL>, 2>& volGrid,
       FsGrid< fsgrids::technical, 2>& technicalGrid,
+      const std::string& versionInfo,
+      const std::string& configInfo,
                DataReducer* dataReducer,
                const uint& index,
                const bool writeGhosts ) {
@@ -1173,6 +1223,16 @@ bool writeGrid(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
    //Write FSGrid metadata
    if( writeFsGridMetadata( technicalGrid, vlsvWriter ) == false ) return false;
    
+   //Write Version Info 
+   if( writeVersionInfo(versionInfo,vlsvWriter,MPI_COMM_WORLD) == false ) {
+      return false;
+   }
+
+   //Write Config Info 
+   if( writeConfigInfo(configInfo,vlsvWriter,MPI_COMM_WORLD) == false ) {
+      return false;
+   }
+
    phiprof::stop("metadataIO");
    phiprof::start("velocityspaceIO");
    if( writeVelocitySpace( mpiGrid, vlsvWriter, index, local_cells ) == false ) return false;
@@ -1241,6 +1301,8 @@ bool writeRestart(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
       FsGrid< std::array<Real, fsgrids::bgbfield::N_BGB>, 2>& BgBGrid,
       FsGrid< std::array<Real, fsgrids::volfields::N_VOL>, 2>& volGrid,
       FsGrid< fsgrids::technical, 2>& technicalGrid,
+      const std::string& versionInfo,
+      const std::string& configInfo,
                   DataReducer& dataReducer,
                   const string& name,
                   const uint& fileIndex,
@@ -1336,6 +1398,16 @@ bool writeRestart(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
 
    //Write FSGrid metadata
    if( writeFsGridMetadata( technicalGrid, vlsvWriter ) == false ) return false;
+
+   //Write Version Info 
+   if( writeVersionInfo(versionInfo,vlsvWriter,MPI_COMM_WORLD) == false ) {
+      return false;
+   }
+
+   //Write Config Info 
+   if( writeConfigInfo(configInfo,vlsvWriter,MPI_COMM_WORLD) == false ) {
+      return false;
+   }
 
    phiprof::stop("metadataIO");
    phiprof::start("reduceddataIO");   

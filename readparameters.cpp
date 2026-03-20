@@ -613,6 +613,19 @@ bool Readparameters::versionMessage() {
     return true;
 }
 
+/** Helper wrapper function to get version info
+   @return std string with the version information
+ */
+std::string Readparameters::versionInfo() {
+   return getVersion();
+}
+
+/** Helper wrapper function to get the config info
+   @return std string with the config information
+ */
+std::string Readparameters::configInfo() {
+   return getConfig(run_config_file_name.c_str());
+}
 
 
 /** Query is Parameters has initialized successfully.
