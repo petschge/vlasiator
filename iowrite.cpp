@@ -932,8 +932,25 @@ bool writeFsGridMetadata(FsGrid< fsgrids::technical, 2>& technicalGrid, vlsv::Wr
   vlsvWriter.writeArray("MESH_GHOST_DOMAINS", xmlAttributes, 0, 1, &dummyghost);
   vlsvWriter.writeArray("MESH_GHOST_LOCALIDS", xmlAttributes, 0, 1, &dummyghost);
 
-  // Write cell "globalID" numbers, which are just the global array indices.
+  // writeDomainSizes
   std::array<int32_t,3>& localSize = technicalGrid.getLocalSize();
+  std::array<uint64_t,2> meshDomainSize({(uint64_t)localSize[0]*(uint64_t)localSize[1]*(uint64_t)localSize[2], 0});
+  vlsvWriter.writeArray("MESH_DOMAIN_SIZES", xmlAttributes, 1, 2, &meshDomainSize[0]);
+
+  // how many MPI ranks we wrote from
+  int size;
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+  vlsvWriter.writeParameter("numWritingRanks", &size);
+
+  // Save the FSgrid decomposition
+  std::array<int, 3> decom = technicalGrid.getDecomposition();
+  if(technicalGrid.getRank() == 0) {
+      vlsvWriter.writeArray("MESH_DECOMPOSITION", xmlAttributes, 3u, 1u, &decom[0]);
+  } else {
+      vlsvWriter.writeArray("MESH_DECOMPOSITION", xmlAttributes, 0u, 3u, &decom[0]);
+  }
+
+  // Write cell "globalID" numbers, which are just the global array indices.
   std::vector<uint64_t> globalIds(localSize[0]*localSize[1]*localSize[2]);
   int i=0;
   for(int z=0; z<localSize[2]; z++) {
@@ -946,16 +963,6 @@ bool writeFsGridMetadata(FsGrid< fsgrids::technical, 2>& technicalGrid, vlsv::Wr
       }
     }
   }
-
-
-  // writeDomainSizes
-  std::array<uint32_t,2> meshDomainSize({globalIds.size(), 0});
-  vlsvWriter.writeArray("MESH_DOMAIN_SIZES", xmlAttributes, 1, 2, &meshDomainSize[0]);
-
-  // how many MPI ranks we wrote from
-  int size;
-  MPI_Comm_size(MPI_COMM_WORLD, &size);
-  vlsvWriter.writeParameter("numWritingRanks", &size);
 
   // Finally, write mesh object itself.
   xmlAttributes.clear();
