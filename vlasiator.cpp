@@ -24,6 +24,8 @@
 #include <iostream>
 #include <cmath>
 #include <vector>
+#include <string>
+#include <filesystem>
 #include <sstream>
 #include <ctime>
 #include <omp.h>
@@ -755,7 +757,10 @@ int main(int argn,char* args[]) {
             phiprof::start("write-system");
             logFile << "(IO): Writing spatial cell and reduced system data to disk, tstep = " << P::tstep << " t = " << P::t << endl << writeVerbose;
             const bool writeGhosts = true;
-            if( writeGrid(mpiGrid,
+	    int count_write_attempts = 0;
+	    const int max_write_attempts = 3;
+	    while(count_write_attempts < max_write_attempts) {
+            	bool write_success = writeGrid(mpiGrid,
                      perBGrid, // TODO: Merge all the fsgrids passed here into one meta-object
                      EGrid,
                      EHallGrid,
@@ -768,8 +773,26 @@ int main(int argn,char* args[]) {
                      technicalGrid,
 		     version,
 		     config,
-                     &outputReducer, i, writeGhosts) == false ) {
-               cerr << "FAILED TO WRITE GRID AT" << __FILE__ << " " << __LINE__ << endl;
+                     &outputReducer, i, writeGhosts);
+		if(write_success) {
+		    break;
+		} else {
+                    cerr << "FAILED TO WRITE GRID AT " << __FILE__ << " " << __LINE__ << endl;
+		    // The error might be because the output directory doesn't exist. Let's try to create it and see what happens.
+		    stringstream fname; // This is the filename that writeGrid will try to write to
+		    fname << P::systemWritePath[i] << "/" << P::systemWriteName[i] ; // We can skip the following timestep part and the trailing .vlsv
+		    string path = fname.str();
+		    // Build up the directories we need by looking for slashes in the filename
+                    std::string build;
+                    for (size_t pos = 0; (pos = path.find('/')) != std::string::npos;) {
+                       build += path.substr(0, pos + 1);
+                       //mkdir(build.c_str(), 0755); // Doing this on all ranks may or may not be a bad idea
+                       path.erase(0, pos + 1);
+                    }
+                    fprintf(stderr, "Trying to create %s for you\n", build.c_str());
+		    filesystem::create_directories(build); // Doing this on all ranks may or may not be a bad idea
+                }
+                count_write_attempts++;
             }
             P::systemWrites[i]++;
             // Special case for large timesteps
