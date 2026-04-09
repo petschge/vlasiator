@@ -67,8 +67,8 @@ namespace projects {
       Project::getParameters();
       typedef Readparameters RP;
 
-      if(getObjectWrapper().particleSpecies.size() > 1) {
-         std::cerr << "The selected project does not support multiple particle populations! Aborting in " << __FILE__ << " line " << __LINE__ << std::endl;
+      if(getObjectWrapper().particleSpecies.size() > 2) {
+         std::cerr << "The selected project does not support more than two particle populations! Aborting in " << __FILE__ << " line " << __LINE__ << std::endl;
          abort();
       }
 
@@ -154,6 +154,15 @@ namespace projects {
       const Real y  = cell->parameters[CellParams::YCRD] + 0.5*cell->parameters[CellParams::DY];
       const Real z  = cell->parameters[CellParams::ZCRD] + 0.5*cell->parameters[CellParams::DZ];
 
+      // This is the case where we're splitting the proton population into two
+      if(getObjectWrapper().particleSpecies.size() > 1.) {
+          if((popID == 0) && (x <= 0.)) {
+              return 0.;
+	  } else if((popID > 0) && (x > 0.)) {
+              return 0.;
+	  }
+      }
+
       const Real mass = getObjectWrapper().particleSpecies[popID].mass;
       Real initRho = profile(this->rho[this->BOTTOM], this->rho[this->TOP], x);
       std::array<Real, 3> initV0 = this->getV0(x, y, z, popID)[0];
@@ -216,6 +225,15 @@ namespace projects {
       const Real x  = cell->parameters[CellParams::XCRD] + 0.5*cell->parameters[CellParams::DX];
       const Real y  = cell->parameters[CellParams::YCRD] + 0.5*cell->parameters[CellParams::DY];
       const Real z  = cell->parameters[CellParams::ZCRD] + 0.5*cell->parameters[CellParams::DZ];
+
+      // This is the case where we're splitting the proton population into two
+      if(getObjectWrapper().particleSpecies.size() > 1.) {
+          if((popID == 0) && (x <= 0.)) {
+              return 0.;
+	  } else if((popID > 0) && (x > 0.)) {
+              return 0.;
+	  }
+      }
 
       const Real mass = getObjectWrapper().particleSpecies[popID].mass;
       Real initRho = profile(this->rho[this->BOTTOM], this->rho[this->TOP], x);

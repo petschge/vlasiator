@@ -71,10 +71,28 @@ for i in tqdm(range(len(timesteps))):
             print("Output step "+str(i)+"/"+str(len(timesteps))+" at time "+str(t))
     f = analysator.vlsvfile.VlsvReader(dirname+"/bulk."+"{:07d}".format(t)+".vlsv")
     cellids = f.read_variable('cellid')
-    vg_ni = f.read_variable('proton/vg_rho')
-    ni = vg_ni[cellids.argsort()].reshape(ysize,xsize)
-    vg_Ui = f.read_variable('proton/vg_v')
-    Ui = vg_Ui[cellids.argsort()].reshape(ysize,xsize,3)
+    if f.check_variable('proton/vg_rho'):
+        vg_ni = f.read_variable('proton/vg_rho')
+        ni = vg_ni[cellids.argsort()].reshape(ysize,xsize)
+        ngreen, nred = None, None
+
+        vg_Ui = f.read_variable('proton/vg_v')
+        Ui = vg_Ui[cellids.argsort()].reshape(ysize,xsize,3)
+    else:
+        vg_ngreen = f.read_variable('green/vg_rho')
+        vg_nred   = f.read_variable('red/vg_rho')
+        ngreen = vg_ngreen[cellids.argsort()].reshape(ysize,xsize)
+        nred   = vg_nred[cellids.argsort()].reshape(ysize,xsize)
+        ni = ngreen + nred
+
+        vg_Ugreen = f.read_variable('green/vg_v')
+        vg_Ured   = f.read_variable('red/vg_v')
+        Ugreen = vg_Ugreen[cellids.argsort()].reshape(ysize,xsize,3)
+        Ured   = vg_Ured[cellids.argsort()].reshape(ysize,xsize,3)
+        Ui = np.zeros( (ni.shape[0],ni.shape[1],3) )
+        Ui[:,:,0] = (ngreen*Ugreen[:,:,0]+nred*Ured[:,:,0])/(ngreen+nred)
+        Ui[:,:,1] = (ngreen*Ugreen[:,:,1]+nred*Ured[:,:,1])/(ngreen+nred)
+        Ui[:,:,2] = (ngreen*Ugreen[:,:,2]+nred*Ured[:,:,2])/(ngreen+nred)
 
     if ni_avg is None:
         ni_avg = np.average(ni)
@@ -96,26 +114,65 @@ for i in tqdm(range(len(timesteps))):
     plt.savefig(dirname+"/ni_"+str(t)+".png")
     plt.close()
 
-    plt.title(title)
-    im = plt.imshow(Ui[:,:,0], extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto")
-    if have_latex:
-        plt.colorbar(im, label=r"$U_x \,/\, m/s$")
-    else:
-        plt.colorbar(im, label="U_x / m/s")
-    plt.contour(ni, extent=(xmin,xmax,ymin,ymax), levels=[ni_avg], colors="black", linewidths=0.5)
-    plt.xlabel("x / m")
-    plt.ylabel("y / m")
-    plt.savefig(dirname+"/Ux_"+str(t)+".png")
-    plt.close()
+    if ngreen is not None:
+        plt.title(title)
+        im = plt.imshow(ngreen, extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto", cmap="Greens")
+        if have_latex:
+            plt.colorbar(im, label=r"$n_i \,/\, m^{-3}$")
+        else:
+            plt.colorbar(im, label="n_i / m^-3")
+        plt.contour(ni, extent=(xmin,xmax,ymin,ymax), levels=[ni_avg], colors="black", linewidths=0.5)
+        plt.xlabel("x / m")
+        plt.ylabel("y / m")
+        plt.savefig(dirname+"/ngreen_"+str(t)+".png")
+        plt.close()
 
-    plt.title(title)
-    im = plt.imshow(Ui[:,:,1], extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto")
-    if have_latex:
-        plt.colorbar(im, label=r"$U_y \,/\, m/s$")
-    else:
-        plt.colorbar(im, label="U_y / m/s")
-    plt.contour(ni, extent=(xmin,xmax,ymin,ymax), levels=[ni_avg], colors="black", linewidths=0.5)
-    plt.xlabel("x / m")
-    plt.ylabel("y / m")
-    plt.savefig(dirname+"/Uy_"+str(t)+".png")
-    plt.close()
+    if nred is not None:
+        plt.title(title)
+        im = plt.imshow(nred, extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto", cmap="Reds")
+        if have_latex:
+            plt.colorbar(im, label=r"$n_i \,/\, m^{-3}$")
+        else:
+            plt.colorbar(im, label="n_i / m^-3")
+        plt.contour(ni, extent=(xmin,xmax,ymin,ymax), levels=[ni_avg], colors="black", linewidths=0.5)
+        plt.xlabel("x / m")
+        plt.ylabel("y / m")
+        plt.savefig(dirname+"/nred"+str(t)+".png")
+        plt.close()
+
+    if nred is not None:
+        plt.title(title)
+        im = plt.imshow(nred/ni, extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto")
+        if have_latex:
+            plt.colorbar(im, label=r"$n_{red} \,/\, n_i$")
+        else:
+            plt.colorbar(im, label="n_red / n_i")
+        plt.contour(nred/ni, extent=(xmin,xmax,ymin,ymax), levels=[0.2,0.5,0.8], colors="black", linewidths=0.5)
+        plt.xlabel("x / m")
+        plt.ylabel("y / m")
+        plt.savefig(dirname+"/mixing"+str(t)+".png")
+        plt.close()
+
+    # plt.title(title)
+    # im = plt.imshow(Ui[:,:,0], extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto")
+    # if have_latex:
+    #     plt.colorbar(im, label=r"$U_x \,/\, m/s$")
+    # else:
+    #     plt.colorbar(im, label="U_x / m/s")
+    # plt.contour(ni, extent=(xmin,xmax,ymin,ymax), levels=[ni_avg], colors="black", linewidths=0.5)
+    # plt.xlabel("x / m")
+    # plt.ylabel("y / m")
+    # plt.savefig(dirname+"/Ux_"+str(t)+".png")
+    # plt.close()
+
+    # plt.title(title)
+    # im = plt.imshow(Ui[:,:,1], extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto")
+    # if have_latex:
+    #     plt.colorbar(im, label=r"$U_y \,/\, m/s$")
+    # else:
+    #     plt.colorbar(im, label="U_y / m/s")
+    # plt.contour(ni, extent=(xmin,xmax,ymin,ymax), levels=[ni_avg], colors="black", linewidths=0.5)
+    # plt.xlabel("x / m")
+    # plt.ylabel("y / m")
+    # plt.savefig(dirname+"/Uy_"+str(t)+".png")
+    # plt.close()
