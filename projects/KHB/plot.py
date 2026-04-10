@@ -142,7 +142,7 @@ for i in tqdm(range(len(timesteps))):
 
     if nred is not None:
         plt.title(title)
-        im = plt.imshow(nred/ni, extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto")
+        im = plt.imshow(nred/ni, extent=(xmin,xmax,ymin,ymax), origin="lower", aspect="auto", cmap="RdYlGn_r")
         if have_latex:
             plt.colorbar(im, label=r"$n_{red} \,/\, n_i$")
         else:

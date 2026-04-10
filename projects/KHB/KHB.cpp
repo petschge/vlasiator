@@ -154,17 +154,18 @@ namespace projects {
       const Real y  = cell->parameters[CellParams::YCRD] + 0.5*cell->parameters[CellParams::DY];
       const Real z  = cell->parameters[CellParams::ZCRD] + 0.5*cell->parameters[CellParams::DZ];
 
-      // This is the case where we're splitting the proton population into two
-      if(getObjectWrapper().particleSpecies.size() > 1.) {
-          if((popID == 0) && (x <= 0.)) {
-              return 0.;
-	  } else if((popID > 0) && (x > 0.)) {
-              return 0.;
-	  }
+      const Real mass = getObjectWrapper().particleSpecies[popID].mass;
+      Real initRho = 0.;
+      if(getObjectWrapper().particleSpecies.size() == 1) {
+          initRho = profile(this->rho[this->BOTTOM], this->rho[this->TOP], x);
+      } else {
+          if(popID == 0) {
+              initRho = profile(this->rho[this->BOTTOM], 0.                  , x);
+          } else {
+              initRho = profile(0.                     , this->rho[this->TOP], x);
+          }
       }
 
-      const Real mass = getObjectWrapper().particleSpecies[popID].mass;
-      Real initRho = profile(this->rho[this->BOTTOM], this->rho[this->TOP], x);
       std::array<Real, 3> initV0 = this->getV0(x, y, z, popID)[0];
       const Real initV0X = initV0[0];
       const Real initV0Y = initV0[1];
@@ -175,7 +176,7 @@ namespace projects {
       creal Bx = profile(this->Bx[this->BOTTOM], this->Bx[this->TOP], x);
       creal By = profile(this->By[this->BOTTOM], this->By[this->TOP], x);
       creal Bz = profile(this->Bz[this->BOTTOM], this->Bz[this->TOP], x);
-      creal initT = (this->P - 0.5 * (Bx * Bx + By * By + Bz * Bz) / mu0) / initRho / physicalconstants::K_B;
+      creal initT = (this->P - 0.5 * (Bx * Bx + By * By + Bz * Bz) / mu0) / profile(this->rho[this->BOTTOM], this->rho[this->TOP], x) / physicalconstants::K_B;
 
       #ifdef USE_GPU
       vmesh::VelocityMesh *vmesh = cell->dev_get_velocity_mesh(popID);
@@ -226,17 +227,17 @@ namespace projects {
       const Real y  = cell->parameters[CellParams::YCRD] + 0.5*cell->parameters[CellParams::DY];
       const Real z  = cell->parameters[CellParams::ZCRD] + 0.5*cell->parameters[CellParams::DZ];
 
-      // This is the case where we're splitting the proton population into two
-      if(getObjectWrapper().particleSpecies.size() > 1.) {
-          if((popID == 0) && (x <= 0.)) {
-              return 0.;
-	  } else if((popID > 0) && (x > 0.)) {
-              return 0.;
-	  }
-      }
-
       const Real mass = getObjectWrapper().particleSpecies[popID].mass;
       Real initRho = profile(this->rho[this->BOTTOM], this->rho[this->TOP], x);
+      if(getObjectWrapper().particleSpecies.size() == 1) {
+          initRho = profile(this->rho[this->BOTTOM], this->rho[this->TOP], x);
+      } else {
+          if(popID == 0) {
+              initRho = profile(this->rho[this->BOTTOM], 0.                  , x);
+          } else {
+              initRho = profile(0.                     , this->rho[this->TOP], x);
+          }
+      }
       std::array<Real, 3> initV0 = this->getV0(x, y, z, popID)[0];
       const Real initV0X = initV0[0];
       const Real initV0Y = initV0[1];
@@ -247,7 +248,7 @@ namespace projects {
       creal Bx = profile(this->Bx[this->BOTTOM], this->Bx[this->TOP], x);
       creal By = profile(this->By[this->BOTTOM], this->By[this->TOP], x);
       creal Bz = profile(this->Bz[this->BOTTOM], this->Bz[this->TOP], x);
-      creal initT = (this->P - 0.5 * (Bx * Bx + By * By + Bz * Bz) / mu0) / initRho / physicalconstants::K_B;
+      creal initT = (this->P - 0.5 * (Bx * Bx + By * By + Bz * Bz) / mu0) / profile(this->rho[this->BOTTOM], this->rho[this->TOP], x) / physicalconstants::K_B;
 
       creal vx = vx_in - initV0X;
       creal vy = vy_in - initV0Y;
