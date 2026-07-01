@@ -2062,6 +2062,10 @@ int main(int argn, char* args[]) {
          extractDistribution<vlsvinterface::Reader>( fileName, mainOptions );
       }
    }
+
+   if(overrideMCAompio) {
+      MPI_T_finalize();
+   }
    MPI_Finalize();
    return 0;
 }
