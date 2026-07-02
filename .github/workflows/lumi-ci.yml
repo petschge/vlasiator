@@ -27,7 +27,7 @@ jobs:
         run: echo "run_dir=$(mktemp -u vlasiator_ci_$(date +%Y%m%d%H%M%S)-XXXXXX)" >> $GITHUB_OUTPUT
       - name: Clone on Lumi
         run: |
-          ssh -i .ssh/id_lumi -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes lrb_462001599_ci@lumi.csc.fi "rundir=${{ steps.vars.outputs.run_dir }}; echo $rundir; cd $rundir; git clone --recurse-submodules https://github.com/fmihpc/vlasiator.git; cd vlasiator; git checkout ${{ github.ref }}; git submodule update --init --recursive;"
+          ssh -i .ssh/id_lumi -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes lrb_462001599_ci@lumi.csc.fi "rundir=${{ steps.vars.outputs.run_dir }}; echo $rundir; mkdir $rundir; cd $rundir; git clone --recurse-submodules https://github.com/fmihpc/vlasiator.git; cd vlasiator; git checkout ${{ github.ref }}; git submodule update --init --recursive;"
       - name: Build Libraries on Lumi
         run: |
           ssh -i .ssh/id_lumi -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes lrb_462001599_ci@lumi.csc.fi "rundir=${{ steps.vars.outputs.run_dir }}; echo $rundir; cd $rundir/vlasiator; export VLASIATOR_ARCH=lumi_cpeGnu; module purge; module load PrgEnv-gnu; module load gcc/10.3.0; module load craype-x86-milan; module load papi; ./fetch_and_build_libraries.sh;"
