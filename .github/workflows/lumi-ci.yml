@@ -25,6 +25,9 @@ jobs:
       - name: Set tag var
         id: vars
         run: echo "run_dir=$(mktemp -u vlasiator_ci_$(date +%Y%m%d%H%M%S)-XXXXXX)" >> $GITHUB_OUTPUT
+      - name: Echo rundir on Lumi
+        run: |
+          ssh -i .ssh/id_lumi -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes lrb_462001599_ci@lumi.csc.fi "export rundir=${{ steps.vars.outputs.run_dir }}; echo \"Rundir is >$rundir<\";"
       - name: Clone on Lumi
         run: |
           ssh -i .ssh/id_lumi -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes lrb_462001599_ci@lumi.csc.fi "export rundir=${{ steps.vars.outputs.run_dir }}; echo $rundir; mkdir $rundir; cd $rundir; git clone --recurse-submodules https://github.com/fmihpc/vlasiator.git; cd vlasiator; git checkout ${{ github.ref }}; git submodule update --init --recursive;"
