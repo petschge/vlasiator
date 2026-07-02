@@ -1,0 +1,27 @@
+name: Lumi-CI
+
+on:
+  # Dispatch this workflow whenever master or dev get a PR or commit
+  push:
+    branches : ["dev","master"]
+  pull_request:
+    branches: ["dev","master"]
+  # ... or when the workflow is started manually
+  workflow_dispatch:
+
+concurrency:
+   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+   cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drop SSH key into VM
+        run: |
+          mkdir -p ~/.ssh/
+          echo ${{secrets.LUMI_SSH_KEY}}  > ~/.ssh/id_lumi
+          sudo chmod 600 ~/.ssh/id_lumi
+      - name: Connect to Lumi
+        run: |
+          ssh -i ~/ssh/id_lumi -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes lumi.csc.fi "touch test"
