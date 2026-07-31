@@ -26,7 +26,7 @@
 #include <cstdlib>
 #include <array>
 #include "../common.h"
-#include "../fieldsolver/fs_common.h"
+#include "../fieldsolver/fs_common.h" // Rec and interpolatePerturbedB
 #include "../fieldsolver/derivatives.hpp"
 #include "../sysboundary/ionosphere.h"
 #include "../logger.h"

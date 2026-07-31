@@ -42,6 +42,10 @@ struct FieldSolverData {
    fsgrids::constehallspan EHall;
    fsgrids::constegradpespan EGradPe;
    fsgrids::constegradpespan EGradPeDt2;
+   #ifdef FS_ES
+   fsgrids::constefieldspan E_ES;
+   fsgrids::constpotentialspan Phi;
+   #endif
    fsgrids::constmomentsspan moments;
    fsgrids::constmomentsspan momentsDt2;
    fsgrids::constdperbspan dPerB;
@@ -58,6 +62,10 @@ struct FieldSolverData {
            const fsgrid::FsData<std::array<Real, fsgrids::ehall::N_EHALL>>& ehall,
            const fsgrid::FsData<std::array<Real, fsgrids::egradpe::N_EGRADPE>>& egradpe,
            const fsgrid::FsData<std::array<Real, fsgrids::egradpe::N_EGRADPE>>& egradpedt2,
+           #ifdef FS_ES
+           const fsgrid::FsData<std::array<Real, fsgrids::efield::N_EFIELD>>& e_es,
+           const fsgrid::FsData<std::array<Real, fsgrids::potential::N_POTENTIAL>>& phi,
+           #endif
            const fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& moments,
            const fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& momentsdt2,
            const fsgrid::FsData<std::array<Real, fsgrids::dperb::N_DPERB>>& dperb,
@@ -67,8 +75,13 @@ struct FieldSolverData {
            const fsgrid::FsData<std::array<Real, fsgrids::volfields::N_VOL>>& vol,
            const fsgrid::FsData<fsgrids::technical>& technical, FieldSolverGrid& fsgrid)
        : fsgrid(fsgrid), perB(perb.view()), perBDt2(perbdt2.view()), E(e.view()), EDt2(edt2.view()),
-         EHall(ehall.view()), EGradPe(egradpe.view()), EGradPeDt2(egradpedt2.view()), moments(moments.view()),
-         momentsDt2(momentsdt2.view()), dPerB(dperb.view()), dMoments(dmoments.view()), dMomentsDt2(dmomentsdt2.view()),
+         EHall(ehall.view()), EGradPe(egradpe.view()), EGradPeDt2(egradpedt2.view()),
+         # ifdef FS_ES
+         E_ES(e_es.view()),
+         Phi(phi.view()),
+         # endif
+         moments(moments.view()), momentsDt2(momentsdt2.view()), dPerB(dperb.view()),
+         dMoments(dmoments.view()), dMomentsDt2(dmomentsdt2.view()),
          BgB(bgb.view()), vol(vol.view()), technical(technical.view()) {}
 };
 
@@ -78,6 +91,10 @@ struct FieldSolverData {
 void initializeGrids(int argn, char** argc, dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,
                      fsgrid::FsData<std::array<Real, fsgrids::bfield::N_BFIELD>>& perb,
                      fsgrid::FsData<std::array<Real, fsgrids::bgbfield::N_BGB>>& bgb,
+#ifdef FS_ES
+                     fsgrid::FsData<std::array<Real, fsgrids::efield::N_EFIELD>>& e_es,
+                     fsgrid::FsData<std::array<Real, fsgrids::potential::N_POTENTIAL>>& Phi,
+#endif
                      fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& moments,
                      fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& momentsdt2,
                      fsgrid::FsData<std::array<Real, fsgrids::dmoments::N_DMOMENTS>>& dmoments,

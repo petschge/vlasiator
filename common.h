@@ -153,6 +153,9 @@ namespace CellParams {
       EXGRADPE,         /*!< Electron pressure gradient term x.*/
       EYGRADPE,         /*!< Electron pressure gradient term y.*/
       EZGRADPE,         /*!< Electron pressure gradient term z.*/
+      EX_ES,         /*!< electrostatic field in x.*/
+      EY_ES,         /*!< electrostatic field in y.*/
+      EZ_ES,         /*!< electrostatic field in z.*/
       RHOM_R,     /*!< RHO after propagation in ordinary space*/
       VX_R,   /*!< VX after propagation in ordinary space*/
       VY_R,   /*!< VY after propagation in ordinary space*/
@@ -284,6 +287,13 @@ namespace fsgrids {
       EZ,     /*!< Total electric field z-component, averaged over cell edge. Used to propagate BX,BY,BZ.*/
       N_EFIELD
    };
+
+   #ifdef FS_ES
+   enum potential {
+      PHI,    /*!< Electric potential at corner of the cell.*/
+      N_POTENTIAL
+   };
+   #endif
 
    enum ehall {
       EXHALL_000_100,   /*!< Hall term x averaged along x on -y/-z edge of spatial cell.*/
@@ -449,6 +459,10 @@ namespace fsgrids {
    typedef std::span<const std::array<Real, fsgrids::dmoments::N_DMOMENTS>> constdmomentsspan;
    typedef std::span<std::array<Real, fsgrids::volfields::N_VOL>> volspan;
    typedef std::span<const std::array<Real, fsgrids::volfields::N_VOL>> constvolspan;
+   #ifdef FS_ES
+   typedef std::span<std::array<Real, fsgrids::potential::N_POTENTIAL>> potentialspan;
+   typedef std::span<const std::array<Real, fsgrids::potential::N_POTENTIAL>> constpotentialspan;
+   #endif
    typedef std::span<technical> technicalspan;
    typedef std::span<const technical> consttechnicalspan;
 

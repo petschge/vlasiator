@@ -158,9 +158,15 @@ void initializeDataReducers(DataReducer * outputReducer, DataReducer * diagnosti
                                                  [=, &retval](const fsgrid::Coordinates coordinates, const fsgrid::FsStencil& stencil, cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
                   const auto lid = stencil.ooo();
                   const auto ri  = gridSize[1]*gridSize[0]*stencil.k + gridSize[0]*stencil.j + stencil.i;
+#ifdef FS_ES
+                  retval[3*ri]   = fieldSolverData.E_ES[lid][fsgrids::efield::EX];
+                  retval[3*ri+1] = fieldSolverData.E_ES[lid][fsgrids::efield::EY];
+                  retval[3*ri+2] = fieldSolverData.E_ES[lid][fsgrids::efield::EZ];
+#else
                   retval[3*ri]   = fieldSolverData.E[lid][fsgrids::efield::EX];
                   retval[3*ri+1] = fieldSolverData.E[lid][fsgrids::efield::EY];
                   retval[3*ri+2] = fieldSolverData.E[lid][fsgrids::efield::EZ];
+#endif
                });
                return retval;
          }
@@ -170,6 +176,30 @@ void initializeDataReducers(DataReducer * outputReducer, DataReducer * diagnosti
             continue;
          }
       }
+#ifdef FS_ES
+      if(P::systemWriteAllDROs || lowercase == "fg_phi" || lowercase == "phi") { // Electric potential at corners of field grid
+         outputReducer->addOperator(new DRO::DataReductionOperatorFsGrid("fg_phi",[](
+            const FieldSolverData& fieldSolverData)->std::vector<double> {
+               const auto* gridSize = &fieldSolverData.fsgrid.getLocalSize()[0];
+               std::vector<double> retval(gridSize[0]*gridSize[1]*gridSize[2]);
+
+               // Iterate through fsgrid cells and extract Phi values
+               fieldSolverData.fsgrid.serial_for([](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+                                                 phiprof::initializeTimer("DRO_fg"), fieldSolverData.technical,
+                                                 [=, &retval](const fsgrid::Coordinates coordinates, const fsgrid::FsStencil& stencil, cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+                  const auto lid = stencil.ooo();
+                  const auto ri = gridSize[1]*gridSize[0]*stencil.k + gridSize[0]*stencil.j + stencil.i;
+                  retval[ri]    = fieldSolverData.Phi[lid][fsgrids::potential::PHI];
+               });
+               return retval;
+         }
+         ));
+         outputReducer->addMetadata(outputReducer->size()-1,"V","$\\mathrm{V}$","$\\Phi$","1.0");
+         if(!P::systemWriteAllDROs) {
+            continue;
+         }
+      }
+#endif
       if(P::systemWriteAllDROs || lowercase == "vg_rhom" || lowercase == "rhom") { // Overall mass density (summed over all populations)
          outputReducer->addOperator(new DRO::DataReductionOperatorCellParams("vg_rhom",CellParams::RHOM,1));
          outputReducer->addMetadata(outputReducer->size()-1,"kg/m^3","$\\mathrm{kg}\\,\\mathrm{m}^{-3}$","$\\rho_\\mathrm{m}$","1.0");

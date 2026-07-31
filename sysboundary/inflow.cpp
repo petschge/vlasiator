@@ -29,7 +29,6 @@
 #include <fstream>
 #include <iostream>
 
-#include "../fieldsolver/fs_common.h"
 #include "../object_wrapper.h"
 #include "../vlasovsolver/vlasovmover.h"
 #include "../grid.h"

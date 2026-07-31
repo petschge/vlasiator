@@ -39,7 +39,6 @@
 #include "parameters.h"
 #include "datareduction/datareducer.h"
 #include "sysboundary/sysboundary.h"
-#include "fieldsolver/fs_common.h"
 #include "fieldsolver/gridGlue.hpp"
 #include "fieldsolver/derivatives.hpp"
 #include "vlasovsolver/cpu_trans_pencils.hpp"
@@ -95,6 +94,10 @@ void initializeGrids(
    dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,
    fsgrid::FsData<std::array<Real, fsgrids::bfield::N_BFIELD>>& perb,
    fsgrid::FsData<std::array<Real, fsgrids::bgbfield::N_BGB>>& bgb,
+#ifdef FS_ES
+   fsgrid::FsData<std::array<Real, fsgrids::efield::N_EFIELD>>& e_es,
+   fsgrid::FsData<std::array<Real, fsgrids::potential::N_POTENTIAL>>& Phi,
+#endif
    fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& moments,
    fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& momentsdt2,
    fsgrid::FsData<std::array<Real, fsgrids::dmoments::N_DMOMENTS>>& dmoments,
@@ -337,7 +340,7 @@ void initializeGrids(
    setBTimer.stop();
    if (P::isRestart) {
       // There are projects that have non-uniform and non-zero perturbed B, e.g. Magnetosphere with dipole type 4.
-      // If restarting with reapplyUponRestart active, we need to set PerB again 
+      // If restarting with reapplyUponRestart active, we need to set PerB again
       // in boundary cells after setProjectBField has populated the BGBXVDCORR etc. terms
       sysBoundaries.applyInitialState(mpiGrid, technical.view(), fsgrid, perb.view(), bgb.view(), project);
    }
@@ -350,7 +353,11 @@ void initializeGrids(
    fsgrid.updateGhostCells(vol.view());
    fsGridGhostTimer.stop();
    phiprof::Timer getFieldsTimer {"getFieldsFromFsGrid"};
-   getFieldsFromFsGrid(vol.view(), bgb.view(), egradpe.view(), dmoments.view(), technical.view(), fsgrid, mpiGrid, cells);
+   getFieldsFromFsGrid(vol.view(), bgb.view(), egradpe.view(),
+#ifdef FS_ES
+                       e_es.view(),
+#endif
+                       dmoments.view(), technical.view(), fsgrid, mpiGrid, cells);
    getFieldsTimer.stop();
 
    setBTimer.stop();

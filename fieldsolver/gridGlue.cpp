@@ -257,6 +257,9 @@ void feedMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>&
 void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
                          fsgrids::constbgbspan bgb,
                          fsgrids::constegradpespan egradpe,
+#ifdef FS_ES
+                         fsgrids::constefieldspan e_es,
+#endif
                          fsgrids::constdmomentsspan dmoments,
                          fsgrids::consttechnicalspan technical, FieldSolverGrid& fsgrid,
                          dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,
@@ -339,6 +342,9 @@ void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
             const std::array<Real, fsgrids::volfields::N_VOL>& volcell = volumefields[fsgridCell];
             const std::array<Real, fsgrids::bgbfield::N_BGB>& bgcell = bgb[fsgridCell];
             const std::array<Real, fsgrids::egradpe::N_EGRADPE>& egradpecell = egradpe[fsgridCell];
+#ifdef FS_ES
+            const std::array<Real, fsgrids::efield::N_EFIELD>& escell = e_es[fsgridCell];
+#endif
             const std::array<Real, fsgrids::dmoments::N_DMOMENTS>& dMomentscell = dmoments[fsgridCell];
 
             // TODO consider pruning these and communicating only when required
@@ -369,6 +375,11 @@ void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
             sendBuffer[ii].sums[FieldsToCommunicate::EXGRADPE] += egradpecell[fsgrids::egradpe::EXGRADPE];
             sendBuffer[ii].sums[FieldsToCommunicate::EYGRADPE] += egradpecell[fsgrids::egradpe::EYGRADPE];
             sendBuffer[ii].sums[FieldsToCommunicate::EZGRADPE] += egradpecell[fsgrids::egradpe::EZGRADPE];
+#ifdef FS_ES
+            sendBuffer[ii].sums[FieldsToCommunicate::EX_ES] += escell[fsgrids::efield::EX];
+            sendBuffer[ii].sums[FieldsToCommunicate::EY_ES] += escell[fsgrids::efield::EY];
+            sendBuffer[ii].sums[FieldsToCommunicate::EZ_ES] += escell[fsgrids::efield::EZ];
+#endif
             sendBuffer[ii].sums[FieldsToCommunicate::EXVOL] += volcell[fsgrids::volfields::EXVOL];
             sendBuffer[ii].sums[FieldsToCommunicate::EYVOL] += volcell[fsgrids::volfields::EYVOL];
             sendBuffer[ii].sums[FieldsToCommunicate::EZVOL] += volcell[fsgrids::volfields::EZVOL];
@@ -436,6 +447,11 @@ void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
          cellParams[CellParams::EXGRADPE] = cellAggregate.second.sums[FieldsToCommunicate::EXGRADPE] / cellAggregate.second.cells;
          cellParams[CellParams::EYGRADPE] = cellAggregate.second.sums[FieldsToCommunicate::EYGRADPE] / cellAggregate.second.cells;
          cellParams[CellParams::EZGRADPE] = cellAggregate.second.sums[FieldsToCommunicate::EZGRADPE] / cellAggregate.second.cells;
+#ifdef FS_ES
+         cellParams[CellParams::EX_ES] = cellAggregate.second.sums[FieldsToCommunicate::EX_ES] / cellAggregate.second.cells;
+         cellParams[CellParams::EY_ES] = cellAggregate.second.sums[FieldsToCommunicate::EY_ES] / cellAggregate.second.cells;
+         cellParams[CellParams::EZ_ES] = cellAggregate.second.sums[FieldsToCommunicate::EZ_ES] / cellAggregate.second.cells;
+#endif
          cellParams[CellParams::EXVOL] = cellAggregate.second.sums[FieldsToCommunicate::EXVOL] / cellAggregate.second.cells;
          cellParams[CellParams::EYVOL] = cellAggregate.second.sums[FieldsToCommunicate::EYVOL] / cellAggregate.second.cells;
          cellParams[CellParams::EZVOL] = cellAggregate.second.sums[FieldsToCommunicate::EZVOL] / cellAggregate.second.cells;
@@ -471,6 +487,11 @@ void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
          cellParams[CellParams::EXGRADPE] = 0;
          cellParams[CellParams::EYGRADPE] = 0;
          cellParams[CellParams::EZGRADPE] = 0;
+#ifdef FS_ES
+         cellParams[CellParams::EX_ES] = 0;
+         cellParams[CellParams::EY_ES] = 0;
+         cellParams[CellParams::EZ_ES] = 0;
+#endif
          cellParams[CellParams::EXVOL] = 0;
          cellParams[CellParams::EYVOL] = 0;
          cellParams[CellParams::EZVOL] = 0;

@@ -31,7 +31,6 @@
 #include "../spatial_cells/spatial_cell_wrapper.hpp"
 #include "sysboundarycondition.h"
 #include "../backgroundfield/fieldfunction.hpp"
-#include "../fieldsolver/fs_common.h"
 
 #include <Eigen/Sparse>
 #include <Eigen/Geometry>

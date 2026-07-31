@@ -84,29 +84,29 @@ extern Logger logFile;
  * \param dt Length of the time step
  * \param subcycles Number of subcycles to compute.
  *
- * \sa propagateMagneticFieldSimple calculateDerivativesSimple calculateUpwindedElectricFieldSimple
+ * \sa propagateMagneticFieldSimple calculateDerivativesSimple ldz_calculateUpwindedElectricFieldSimple
  * calculateVolumeAveragedFields calculateBVOLDerivativesSimple
  *
  */
-bool propagateFields(fsgrids::perbspan perb,
-                     fsgrids::perbspan perbdt2,
-                     fsgrids::efieldspan e,
-                     fsgrids::efieldspan edt2,
-                     fsgrids::ehallspan ehall,
-                     fsgrids::egradpespan egradpe,
-                     fsgrids::egradpespan egradpedt2,
-                     fsgrids::momentsspan moments,
-                     fsgrids::momentsspan momentsdt2,
-                     fsgrids::dperbspan dperb,
-                     fsgrids::dmomentsspan dmoments,
-                     fsgrids::dmomentsspan dmomentsdt2,
-                     fsgrids::bgbspan bgb,
-                     fsgrids::volspan vol,
-                     fsgrids::technicalspan technical,
-                     FieldSolverGrid &fsgrid,
-                     SysBoundary& sysBoundaries,
-                     creal& dt,
-                     cuint subcycles) {
+bool ldz_propagateFields(fsgrids::perbspan perb,
+                         fsgrids::perbspan perbdt2,
+                         fsgrids::efieldspan e,
+                         fsgrids::efieldspan edt2,
+                         fsgrids::ehallspan ehall,
+                         fsgrids::egradpespan egradpe,
+                         fsgrids::egradpespan egradpedt2,
+                         fsgrids::momentsspan moments,
+                         fsgrids::momentsspan momentsdt2,
+                         fsgrids::dperbspan dperb,
+                         fsgrids::dmomentsspan dmoments,
+                         fsgrids::dmomentsspan dmomentsdt2,
+                         fsgrids::bgbspan bgb,
+                         fsgrids::volspan vol,
+                         fsgrids::technicalspan technical,
+                         FieldSolverGrid &fsgrid,
+                         SysBoundary& sysBoundaries,
+                         creal& dt,
+                         cuint subcycles) {
 
    if (subcycles == 0) {
       cerr << "Field solver subcycles cannot be 0." << endl;
@@ -146,7 +146,7 @@ bool propagateFields(fsgrids::perbspan perb,
             true // communicateMomentsDerivatives
          );
       }
-      calculateUpwindedElectricFieldSimple(
+      ldz_calculateUpwindedElectricFieldSimple(
          perb,
          perbdt2,
          e,
@@ -190,7 +190,7 @@ bool propagateFields(fsgrids::perbspan perb,
             true // communicateMomentsDerivatives
          );
       }
-      calculateUpwindedElectricFieldSimple(
+      ldz_calculateUpwindedElectricFieldSimple(
          perb,
          perbdt2,
          e,
@@ -234,7 +234,7 @@ bool propagateFields(fsgrids::perbspan perb,
             true // communicateMomentsDerivatives
          );
       }
-      calculateUpwindedElectricFieldSimple(
+      ldz_calculateUpwindedElectricFieldSimple(
          perb,
          perbdt2,
          e,
@@ -293,7 +293,7 @@ bool propagateFields(fsgrids::perbspan perb,
                subcycleCount == 0 // communicateMomentsDerivatives
             );
          }
-         calculateUpwindedElectricFieldSimple(
+         ldz_calculateUpwindedElectricFieldSimple(
             perb,
             perbdt2,
             e,
@@ -340,7 +340,7 @@ bool propagateFields(fsgrids::perbspan perb,
                subcycleCount == 0 // communicateMomentsDerivatives
             );
          }
-         calculateUpwindedElectricFieldSimple(
+         ldz_calculateUpwindedElectricFieldSimple(
             perb,
             perbdt2,
             e,

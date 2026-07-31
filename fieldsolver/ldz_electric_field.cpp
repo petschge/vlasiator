@@ -445,16 +445,16 @@ struct DataArrays {
  * \param RKCase Element in the enum defining the Runge-Kutta method steps
  * \param gridSpacing fsgrid cell size in x,y,z
  */
-void calculateEdgeElectricFieldX(fsgrids::perbspan perb,
-                                 fsgrids::constdperbspan dperb,
-                                 fsgrids::efieldspan e,
-                                 fsgrids::constehallspan ehall,
-                                 fsgrids::constegradpespan egradpe,
-                                 fsgrids::constmomentsspan moments,
-                                 fsgrids::constdmomentsspan dmoments,
-                                 fsgrids::constbgbspan bgb,
-                                 fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
-                                 int32_t RKCase, const std::array<Real, 3>& gridSpacing) {
+void ldz_calculateEdgeElectricFieldX(fsgrids::perbspan perb,
+                                     fsgrids::constdperbspan dperb,
+                                     fsgrids::efieldspan e,
+                                     fsgrids::constehallspan ehall,
+                                     fsgrids::constegradpespan egradpe,
+                                     fsgrids::constmomentsspan moments,
+                                     fsgrids::constdmomentsspan dmoments,
+                                     fsgrids::constbgbspan bgb,
+                                     fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
+                                     int32_t RKCase, const std::array<Real, 3>& gridSpacing) {
    fsdebugCheck(stencil, perb.size(), __FILE__, __LINE__);
 
    // An edge has four neighbouring spatial cells. Calculate
@@ -668,16 +668,16 @@ void calculateEdgeElectricFieldX(fsgrids::perbspan perb,
  * \param RKCase Element in the enum defining the Runge-Kutta method steps
  * \param gridSpacing fsgrid cell size in x,y,z
  */
-void calculateEdgeElectricFieldY(fsgrids::perbspan perb,
-                                 fsgrids::constdperbspan dperb,
-                                 fsgrids::efieldspan e,
-                                 fsgrids::constehallspan ehall,
-                                 fsgrids::constegradpespan egradpe,
-                                 fsgrids::constmomentsspan moments,
-                                 fsgrids::constdmomentsspan dmoments,
-                                 fsgrids::constbgbspan bgb,
-                                 fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
-                                 int32_t RKCase, const std::array<Real, 3>& gridSpacing) {
+void ldz_calculateEdgeElectricFieldY(fsgrids::perbspan perb,
+                                     fsgrids::constdperbspan dperb,
+                                     fsgrids::efieldspan e,
+                                     fsgrids::constehallspan ehall,
+                                     fsgrids::constegradpespan egradpe,
+                                     fsgrids::constmomentsspan moments,
+                                     fsgrids::constdmomentsspan dmoments,
+                                     fsgrids::constbgbspan bgb,
+                                     fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
+                                     int32_t RKCase, const std::array<Real, 3>& gridSpacing) {
    fsdebugCheck(stencil, perb.size(), __FILE__, __LINE__);
 
    // An edge has four neighbouring spatial cells. Calculate
@@ -888,16 +888,16 @@ void calculateEdgeElectricFieldY(fsgrids::perbspan perb,
  * \param RKCase Element in the enum defining the Runge-Kutta method steps
  * \param gridSpacing fsgrid cell size in x,y,z
  */
-void calculateEdgeElectricFieldZ(fsgrids::perbspan perb,
-                                 fsgrids::constdperbspan dperb,
-                                 fsgrids::efieldspan e,
-                                 fsgrids::constehallspan ehall,
-                                 fsgrids::constegradpespan egradpe,
-                                 fsgrids::constmomentsspan moments,
-                                 fsgrids::constdmomentsspan dmoments,
-                                 fsgrids::constbgbspan bgb,
-                                 fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
-                                 int32_t RKCase, const std::array<Real, 3>& gridSpacing) {
+void ldz_calculateEdgeElectricFieldZ(fsgrids::perbspan perb,
+                                     fsgrids::constdperbspan dperb,
+                                     fsgrids::efieldspan e,
+                                     fsgrids::constehallspan ehall,
+                                     fsgrids::constegradpespan egradpe,
+                                     fsgrids::constmomentsspan moments,
+                                     fsgrids::constdmomentsspan dmoments,
+                                     fsgrids::constbgbspan bgb,
+                                     fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
+                                     int32_t RKCase, const std::array<Real, 3>& gridSpacing) {
    fsdebugCheck(stencil, perb.size(), __FILE__, __LINE__);
 
    // An edge has four neighbouring spatial cells. Calculate
@@ -1106,19 +1106,19 @@ void calculateEdgeElectricFieldZ(fsgrids::perbspan perb,
  * \param sysBoundaries System boundary conditions existing
  * \param RKCase Element in the enum defining the Runge-Kutta method steps
  *
- * \sa calculateUpwindedElectricFieldSimple calculateEdgeElectricFieldX calculateEdgeElectricFieldY calculateEdgeElectricFieldZ
+ * \sa ldz_calculateUpwindedElectricFieldSimple ldz_calculateEdgeElectricFieldX ldz_calculateEdgeElectricFieldY ldz_calculateEdgeElectricFieldZ
  *
  */
-void calculateElectricField(fsgrids::perbspan perb,
-                            fsgrids::constdperbspan dperb,
-                            fsgrids::efieldspan e,
-                            fsgrids::constehallspan ehall,
-                            fsgrids::constegradpespan egradpe,
-                            fsgrids::constmomentsspan moments,
-                            fsgrids::constdmomentsspan dmoments,
-                            fsgrids::constbgbspan bgb,
-                            fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
-                            const std::array<Real, 3>& gridSpacing, SysBoundary& sysBoundaries, int32_t RKCase) {
+void ldz_calculateElectricField(fsgrids::perbspan perb,
+                                fsgrids::constdperbspan dperb,
+                                fsgrids::efieldspan e,
+                                fsgrids::constehallspan ehall,
+                                fsgrids::constegradpespan egradpe,
+                                fsgrids::constmomentsspan moments,
+                                fsgrids::constdmomentsspan dmoments,
+                                fsgrids::constbgbspan bgb,
+                                fsgrids::technicalspan technical, const fsgrid::FsStencil& stencil,
+                                const std::array<Real, 3>& gridSpacing, SysBoundary& sysBoundaries, int32_t RKCase) {
    cuint cellSysBoundaryFlag = technical[stencil.ooo()].sysBoundaryFlag;
    cuint bitfield = technical[stencil.ooo()].SOLVE;
 
@@ -1128,22 +1128,22 @@ void calculateElectricField(fsgrids::perbspan perb,
    }
 
    if ((bitfield & compute::EX) == compute::EX) {
-      calculateEdgeElectricFieldX(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil, RKCase,
-                                  gridSpacing);
+      ldz_calculateEdgeElectricFieldX(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil,RKCase,
+                                      gridSpacing);
    } else {
       sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e, stencil, 0);
    }
 
    if ((bitfield & compute::EY) == compute::EY) {
-      calculateEdgeElectricFieldY(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil, RKCase,
-                                  gridSpacing);
+      ldz_calculateEdgeElectricFieldY(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil, RKCase,
+                                      gridSpacing);
    } else {
       sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e, stencil, 1);
    }
 
    if ((bitfield & compute::EZ) == compute::EZ) {
-      calculateEdgeElectricFieldZ(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil, RKCase,
-                                  gridSpacing);
+      ldz_calculateEdgeElectricFieldZ(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil, RKCase,
+                                      gridSpacing);
    } else {
       sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e, stencil, 2);
    }
@@ -1172,24 +1172,24 @@ void calculateElectricField(fsgrids::perbspan perb,
  * \param RKCase Element in the enum defining the Runge-Kutta method steps
  * \param communicateEGradPeOrMomentsDerivatives Boolean flag whether grad(Pe) electric field or moments need a ghost update
  *
- * \sa calculateElectricField calculateEdgeElectricFieldX calculateEdgeElectricFieldY calculateEdgeElectricFieldZ
+ * \sa ldz_calculateElectricField ldz_calculateEdgeElectricFieldX ldz_calculateEdgeElectricFieldY ldz_calculateEdgeElectricFieldZ
  */
-void calculateUpwindedElectricFieldSimple(fsgrids::perbspan perb,
-                                          fsgrids::perbspan perbdt2,
-                                          fsgrids::efieldspan e,
-                                          fsgrids::efieldspan edt2,
-                                          fsgrids::ehallspan ehall,
-                                          fsgrids::egradpespan egradpe,
-                                          fsgrids::egradpespan egradpedt2,
-                                          fsgrids::momentsspan moments,
-                                          fsgrids::momentsspan momentsdt2,
-                                          fsgrids::dperbspan dperb,
-                                          fsgrids::dmomentsspan dmoments,
-                                          fsgrids::dmomentsspan dmomentsdt2,
-                                          fsgrids::bgbspan bgb,
-                                          fsgrids::technicalspan technical, FieldSolverGrid &fsgrid,
-                                          SysBoundary& sysBoundaries, int32_t RKCase,
-                                          const bool communicateEGradPeOrMomentsDerivatives) {
+void ldz_calculateUpwindedElectricFieldSimple(fsgrids::perbspan perb,
+                                              fsgrids::perbspan perbdt2,
+                                              fsgrids::efieldspan e,
+                                              fsgrids::efieldspan edt2,
+                                              fsgrids::ehallspan ehall,
+                                              fsgrids::egradpespan egradpe,
+                                              fsgrids::egradpespan egradpedt2,
+                                              fsgrids::momentsspan moments,
+                                              fsgrids::momentsspan momentsdt2,
+                                              fsgrids::dperbspan dperb,
+                                              fsgrids::dmomentsspan dmoments,
+                                              fsgrids::dmomentsspan dmomentsdt2,
+                                              fsgrids::bgbspan bgb,
+                                              fsgrids::technicalspan technical, FieldSolverGrid &fsgrid,
+                                              SysBoundary& sysBoundaries, int32_t RKCase,
+                                              const bool communicateEGradPeOrMomentsDerivatives) {
    const size_t numCells = fsgrid.getNumCells();
 
    if (not(RKCase == RK_ORDER1 || RKCase == RK_ORDER2_STEP2)) {
@@ -1226,8 +1226,8 @@ void calculateUpwindedElectricFieldSimple(fsgrids::perbspan perb,
    fsgrid.parallel_for([](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
                        phiprof::initializeTimer("Electric field compute cells"), technical,
                        [=, &sysBoundaries](const fsgrid::Coordinates &coordinates, const fsgrid::FsStencil& stencil, cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-                          calculateElectricField(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil,
-                                                 coordinates.physicalGridSpacing, sysBoundaries, RKCase);
+                          ldz_calculateElectricField(perb, dperb, e, ehall, egradpe, moments, dmoments, bgb, technical, stencil,
+                                                     coordinates.physicalGridSpacing, sysBoundaries, RKCase);
                        });
 
    mpiTimer.start();

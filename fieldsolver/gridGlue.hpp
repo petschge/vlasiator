@@ -30,6 +30,11 @@ enum FieldsToCommunicate {
    EXGRADPE,
    EYGRADPE,
    EZGRADPE,
+#ifdef FS_ES
+   EX_ES,
+   EY_ES,
+   EZ_ES,
+#endif
    EXVOL,
    EYVOL,
    EZVOL,
@@ -82,6 +87,9 @@ void feedMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>&
 void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
                          fsgrids::constbgbspan bgb,
                          fsgrids::constegradpespan egradpe,
+#ifdef FS_ES
+                         fsgrids::constefieldspan e_es,
+#endif
                          fsgrids::constdmomentsspan dmoments,
                          fsgrids::consttechnicalspan technical, FieldSolverGrid& fsgrid,
                          dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,

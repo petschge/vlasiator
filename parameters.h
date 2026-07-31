@@ -67,6 +67,7 @@ struct Parameters {
    static Real fieldSolverMaxCFL;    /*!< The maximum CFL limit for propagation of fields. Used to set timestep if
                                         useCFLlimit is true.*/
    static uint fieldSolverSubcycles; /*!< The number of field solver subcycles to compute.*/
+   static std::string fieldSolverMethod; /* Select a way to compute the electric and magnetic fields.*/
 
    static uint tstep_min; /*!< Timestep when simulation starts, needed for restarts.*/
    static uint tstep_max; /*!< Maximum timestep. */
