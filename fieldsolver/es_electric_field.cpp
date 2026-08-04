@@ -25,7 +25,6 @@ void es_calculateElectricFieldX(fsgrids::efieldspan e_es, fsgrids::potentialspan
                                     const fsgrid::FsStencil& stencil,
                                     const std::array<Real, 3>& gridSpacing) {
 
-   //e_es[stencil.ooo()][fsgrids::efield::EX] = -(Phi[stencil.poo()][fsgrids::potential::PHI]-Phi[stencil.ooo()][fsgrids::potential::PHI])/gridSpacing[0];
    e_es[stencil.ooo()][fsgrids::efield::EX] = -(Phi[stencil.poo()][fsgrids::potential::PHI]-Phi[stencil.moo()][fsgrids::potential::PHI])/(2.*gridSpacing[0]);
 }
 
@@ -43,7 +42,6 @@ void es_calculateElectricFieldX(fsgrids::efieldspan e_es, fsgrids::potentialspan
 void es_calculateElectricFieldY(fsgrids::efieldspan e_es, fsgrids::potentialspan Phi,
                                     const fsgrid::FsStencil& stencil,
                                     const std::array<Real, 3>& gridSpacing) {
-   //e_es[stencil.ooo()][fsgrids::efield::EY] = -(Phi[stencil.opo()][fsgrids::potential::PHI]-Phi[stencil.ooo()][fsgrids::potential::PHI])/gridSpacing[1];
    e_es[stencil.ooo()][fsgrids::efield::EY] = -(Phi[stencil.opo()][fsgrids::potential::PHI]-Phi[stencil.omo()][fsgrids::potential::PHI])/(2.*gridSpacing[1]);
 }
 
@@ -85,43 +83,28 @@ void es_calculateElectricField(fsgrids::efieldspan e_es, fsgrids::potentialspan 
    cuint cellSysBoundaryFlag = technical[stencil.ooo()].sysBoundaryFlag;
    cuint bitfield = technical[stencil.ooo()].SOLVE;
 
-   // const auto lid = stencil.ooo();
-   // const std::array<fsgrid::FsSize_t, 3> globalIndices = fsgrid.localToGlobal(stencil.i, stencil.j, stencil.k);
-   // fprintf(stderr, "lid = %ld, globalIndices %d,%d,%d, skip %s, compute E %s,%s,%s\n",
-   //       lid,
-   //       globalIndices[0], globalIndices[1], globalIndices[2],
-   //       (cellSysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || cellSysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) ? "true" : "false",
-   //       ((bitfield & compute::EX) == compute::EX) ? "true" : "false",
-   //       ((bitfield & compute::EY) == compute::EY) ? "true" : "false",
-   //       ((bitfield & compute::EZ) == compute::EZ) ? "true" : "false"
-   //       );
-   // no cells skipped, all calculate all E field components
-   // globalIndixes[0] runs from 0 ... x_length-1 (inclusively)
-   // globalIndixes[1] runs from 0 ... y_length-1 (inclusively)
-   // globalIndixes[2] runs from 0 ... z_length-1 (inclusively)
-
    if (cellSysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE ||
        cellSysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) {
       return;
    }
 
-   // if ((bitfield & compute::EX) == compute::EX) {
+   if ((bitfield & compute::EX) == compute::EX) {
        es_calculateElectricFieldX(e_es, Phi, stencil, gridSpacing);
-   // } else {
-   //    sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e, stencil, 0);
-   // }
+   } else {
+       sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e_es, stencil, 0);
+   }
 
-   // if ((bitfield & compute::EY) == compute::EY) {
+   if ((bitfield & compute::EY) == compute::EY) {
        es_calculateElectricFieldY(e_es, Phi, stencil, gridSpacing);
-   // } else {
-   //    sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e, stencil, 1);
-   // }
+   } else {
+      sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e_es, stencil, 1);
+   }
 
-   // if ((bitfield & compute::EZ) == compute::EZ) {
+   if ((bitfield & compute::EZ) == compute::EZ) {
        es_calculateElectricFieldZ(e_es, Phi, stencil, gridSpacing);
-   // } else {
-   //    sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e, stencil, 2);
-   // }
+   } else {
+      sysBoundaries.getSysBoundary(cellSysBoundaryFlag)->fieldSolverBoundaryCondElectricField(e_es, stencil, 2);
+   }
 }
 
 /*! \brief High-level electric potential computation function.
@@ -142,14 +125,11 @@ void es_ElectrostaticPotential(fsgrids::potentialspan Phi,
    MPI_Comm_rank(MPI_COMM_WORLD,&myRank);
 
    const std::array<fsgrid::FsSize_t, 3>& globalSize = fsgrid.getGlobalSize();
-   // fprintf(stderr, "Solving the potential on a %d x %d x %d grid\n", globalSize[0], globalSize[1], globalSize[2]);
-   // this is just x_length x y_length x z_length, no ghost cells, nothing
 
    Array3D rho(globalSize[0],globalSize[1],globalSize[2], 0.0);
    Array3D phi(globalSize[0],globalSize[1],globalSize[2], 0.0);
 
-   // Grab the net charge density from all species
-   // This is at cell centers
+   // Get the charge from all species at cell centers and combine to get ned charge density
    fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
       phiprof::initializeTimer("Collect net charge"),
@@ -162,22 +142,6 @@ void es_ElectrostaticPotential(fsgrids::potentialspan Phi,
        cuint sysBoundaryLayer
       ) {
          const std::array<fsgrid::FsSize_t, 3> globalIndices = coordinates.localToGlobal(stencil.i, stencil.j, stencil.k);
-
-         /*
-         // If we want it at cell corners we can interpolate to move it to the
-         // corner. The fact that we suppress high-k fluctuations is likely ok,
-         // but if we need those we could use a compensating filter or do
-         // something clever in Fourier space, like multiplying by
-         // exp(k*deltax/2) to shift the charge density by dx/2 without
-         // interpolation.
-         rho(globalIndices[0], globalIndices[1], globalIndices[2]) = 0.125 * (
-            moments[stencil.ooo()][fsgrids::moments::RHOQ] + moments[stencil.oom()][fsgrids::moments::RHOQ] +
-            moments[stencil.omo()][fsgrids::moments::RHOQ] + moments[stencil.omm()][fsgrids::moments::RHOQ] +
-            moments[stencil.moo()][fsgrids::moments::RHOQ] + moments[stencil.mom()][fsgrids::moments::RHOQ] +
-            moments[stencil.mmo()][fsgrids::moments::RHOQ] + moments[stencil.mmm()][fsgrids::moments::RHOQ] );
-         */
-
-         // If we want it at cell centers it's trivial
          rho(globalIndices[0], globalIndices[1], globalIndices[2]) = moments[stencil.ooo()][fsgrids::moments::RHOQ];
       });
 
@@ -189,11 +153,8 @@ void es_ElectrostaticPotential(fsgrids::potentialspan Phi,
       MPI_Reduce(&rho.data[0], nullptr, globalSize[0]*globalSize[1]*globalSize[2], MPI_DOUBLE, MPI_SUM, MASTER_RANK, MPI_COMM_WORLD);
    }
 
-
    // Serial for now. The field solver is sufficently cheaper than the Vlasov
-   // solver this is coupled to. The matrix inversion solver using a five-point
-   // stencil that will work for other boundary conditions will be properly
-   // parallelized.
+   // solver this is coupled to.
    if(myRank == MASTER_RANK) {
       // We'll convert rho to complex numbers and perform a complex-to-complex
       // 3d DFT forward, operate in k space and then perform the inverse
@@ -253,7 +214,7 @@ void es_ElectrostaticPotential(fsgrids::potentialspan Phi,
       // Perform inverse FFT on rho_complex
       fftw_execute(rwd_plan);
 
-      // Copy out the real part of rho_complex to rho, which will hold phi at that point
+      // Copy out the real part of complex_buffer, which holds phi at that point
       double max_real_mag = 0.;
       double max_imag_mag = 0.;
       for (unsigned int i = 0; i < globalSize[0]; ++i) {
@@ -306,7 +267,7 @@ void es_ElectrostaticPotential(fsgrids::potentialspan Phi,
 
 /*! \brief High-level electric field computation function.
  *
- * Computes the potential and the calculates the edge electric fields from finite differences
+ * Computes the potential and the calculates the electric fields from finite differences
  *
  * \param e_es fsGrid holding the electric field quantities
  * \param Phi fsGrid holding the elctric potential
