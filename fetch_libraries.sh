@@ -20,6 +20,12 @@ cd phiprof
 git checkout 605a7247c85d967fe22fe079c96c817b461c92b1
 cd ..
 
+# Hypre
+git clone https://github.com/hypre-space/hypre.git
+cd hypre
+git checkout 9fbaf60dc9435e71ff5af984f1e12e2bf8be6ad8
+cd ..
+
 # VLSV
 if [[ $PLATFORM != "-appleM1" ]]; then
    git clone https://github.com/fmihpc/vlsv.git

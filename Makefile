@@ -56,13 +56,13 @@ AR ?= ar
 # COMPFLAGS += -DFS_1ST_ORDER_TIME
 
 # electro static field solver that could be selected at runtime
-# set to one to build, set to zero to skip and avoid the fftw dependency
+# set to one to build, set to zero to skip and avoid the hypre dependency
 USE_ES=1
 ifeq ($(USE_ES),1)
     $(info compiling electrostatic solver as well)
     # Add -DFS_ES to also compile an explicit electrostatic solver
     COMPFLAGS += -DFS_ES
-    LIBS += -lfftw3
+    LIBS += ${LIB_HYPRE}
     OBJS += es_main.o es_electric_field.o
 else
     $(info skipping electrostatic solver)

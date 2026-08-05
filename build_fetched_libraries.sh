@@ -31,8 +31,6 @@ else
    PARALLEL=4
 fi
 
-
-
 # Build phiprof
 #git clone https://github.com/fmihpc/phiprof/
 cd phiprof/src
@@ -54,6 +52,17 @@ else
 fi
 cp ../include/* $WORKSPACE/libraries${PLATFORM}/include
 cp ../lib/* $WORKSPACE/libraries${PLATFORM}/lib
+cd ../..
+
+# Build Hypre
+#git clone https://github.com/hypre-space/hypre.git
+cd hypre/src
+echo "building HYPRES"
+pwd
+echo "./configure --prefix=$WORKSPACE/libraries${PLATFORM}"
+./configure --prefix=$WORKSPACE/libraries${PLATFORM}
+echo "make install"
+make install
 cd ../..
 
 # Build VLSV
