@@ -68,6 +68,21 @@ else
     $(info skipping electrostatic solver)
 endif
 
+# Fancy implicit field solver that could be selected at runtime
+# set to one to build, set to zero to skip and avoid the hypre dependency
+USE_AP=1
+ifeq ($(USE_AP),1)
+    $(info compiling implicit field solver as well)
+    # Add -DFS_AP to also compile an implicit electromagnetic solver
+    COMPFLAGS += -DFS_AP
+    LIBS += ${LIB_HYPRE}
+    OBJS += ap_electric_field.o
+else
+    $(info skipping implicit field solver)
+endif
+
+
+
 #Skip deprecated C++ bindings from OpenMPI
 COMPFLAGS += -D OMPI_SKIP_MPICXX
 # Allow MCA io to be set to ompio, otherwise the code is overriding and setting ^ompio. (OpenMPI only, no effect with other MPI implementations.)

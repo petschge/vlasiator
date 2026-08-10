@@ -254,6 +254,98 @@ void feedMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>&
    }
 }
 
+#ifdef FS_AP
+void feedSpeciesMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,
+                           const std::vector<CellID>& cells,
+                           const std::vector<std::vector<Real>>& speciesRhoQ,
+                           const std::vector<std::vector<std::array<Real,3>>>& speciesJ,
+                           std::vector<fsgrids::speciesrhoqspan>& fsSpeciesRhoQ,
+                           std::vector<fsgrids::speciesjspan>& fsSpeciesJ) {
+
+   const uint numPops = speciesRhoQ.size();
+   // 1 rho_q real + 3 J reals per species per cell.
+   const int perSpeciesReals = fsgrids::speciesrhoq::N_SPECIES_RHOQ + fsgrids::speciesj::N_SPECIES_J;
+   const int perCellReals = (int)numPops * perSpeciesReals;
+
+   // FIXME: speciesRhoQ/speciesJ are indexed by POSITION IN `cells` (as
+   // written by captureSpeciesChargeDensity/captureSpeciesCurrentDensity in
+   // vlasiator.cpp), not by CellID -- build the lookup once. Is there a
+   // smarter way to do this?
+   std::map<CellID, size_t> indexOfCell;
+   for (size_t c=0; c<cells.size(); ++c) {
+      indexOfCell[cells[c]] = c;
+   }
+
+   int ii;
+   std::vector<CellID> dccrgCells = cells;
+   std::sort(dccrgCells.begin(), dccrgCells.end());
+
+   std::map<int, std::vector<Real>> receivedData;
+   std::map<int, std::vector<Real>> sendData;
+   std::vector<MPI_Request> sendRequests;
+   std::vector<MPI_Request> receiveRequests;
+
+   // Post receives
+   receiveRequests.resize(onFsgridMapRemoteProcessGlobal.size());
+   ii = 0;
+   for (auto const& receives : onFsgridMapRemoteProcessGlobal) {
+      int process = receives.first;
+      int count = receives.second.size();
+      receivedData[process].resize(count * perCellReals);
+      MPI_Irecv(receivedData[process].data(), count * perCellReals * sizeof(Real),
+                MPI_BYTE, process, 1, MPI_COMM_WORLD, &(receiveRequests[ii++]));
+   }
+
+   // Launch sends: for each cell, pack (rho_q, Jx, Jy, Jz) for every
+   // population in turn -- population-major, matching the unpack loop
+   // below.
+   ii = 0;
+   sendRequests.resize(onDccrgMapRemoteProcessGlobal.size());
+   for (auto const& snd : onDccrgMapRemoteProcessGlobal) {
+      int targetProc = snd.first;
+      auto& sendBuffer = sendData[targetProc];
+      for (CellID sendCell : snd.second) {
+         const size_t idx = indexOfCell.at(sendCell);
+         for (uint popID=0; popID<numPops; ++popID) {
+            sendBuffer.push_back(speciesRhoQ[popID][idx]);
+            sendBuffer.push_back(speciesJ[popID][idx][0]);
+            sendBuffer.push_back(speciesJ[popID][idx][1]);
+            sendBuffer.push_back(speciesJ[popID][idx][2]);
+         }
+      }
+      MPI_Isend(sendBuffer.data(), sendBuffer.size() * sizeof(Real),
+                MPI_BYTE, targetProc, 1, MPI_COMM_WORLD, &(sendRequests[ii]));
+      ii++;
+   }
+
+   MPI_Waitall(receiveRequests.size(), receiveRequests.data(), MPI_STATUSES_IGNORE);
+
+   for (auto const& receives : onFsgridMapRemoteProcessGlobal) {
+      int process = receives.first;
+      Real* receiveBuffer = receivedData[process].data();
+      for (auto const& cell : receives.second) {
+         // this part heavily relies on both sender and receiver having cellids sorted!
+         for (auto lid : onFsgridMapCellsGlobal[cell]) {
+            for (uint popID=0; popID<numPops; ++popID) {
+               auto& rq = fsSpeciesRhoQ[popID][static_cast<size_t>(lid)];
+               auto& j  = fsSpeciesJ[popID][static_cast<size_t>(lid)];
+               rq[fsgrids::speciesrhoq::SRHOQ] = receiveBuffer[popID*perSpeciesReals + 0];
+               j[fsgrids::speciesj::SJX]       = receiveBuffer[popID*perSpeciesReals + 1];
+               j[fsgrids::speciesj::SJY]       = receiveBuffer[popID*perSpeciesReals + 2];
+               j[fsgrids::speciesj::SJZ]       = receiveBuffer[popID*perSpeciesReals + 3];
+            }
+         }
+         receiveBuffer += perCellReals;
+      }
+   }
+
+   MPI_Waitall(sendRequests.size(), sendRequests.data(), MPI_STATUSES_IGNORE);
+
+   // NOTE: unlike feedMomentsIntoFsGrid, no AMR triangle-filter and
+   // no outflow-boundary copy are applied here
+}
+#endif
+
 void getFieldsFromFsGrid(fsgrids::constvolspan volumefields,
                          fsgrids::constbgbspan bgb,
                          fsgrids::constegradpespan egradpe,

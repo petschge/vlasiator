@@ -1,5 +1,6 @@
 #include "fs_common.h"
 #include "es_electric_field.hpp"
+#include <HYPRE.h>
 #include <HYPRE_struct_ls.h>
 #include <vector>
 

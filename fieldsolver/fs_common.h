@@ -54,11 +54,19 @@ bool propagateFields(fsgrids::perbspan perb,
                      fsgrids::egradpespan egradpe,
                      fsgrids::egradpespan egradpedt2,
 #ifdef FS_ES
+                     // electrostatic field and potential
                      fsgrids::efieldspan e_es,
                      fsgrids::potentialspan Phi,
 #endif
                      fsgrids::momentsspan moments,
                      fsgrids::momentsspan momentsdt2,
+#ifdef FS_AP
+                     // per-species rho_s^k and J_s^{k*}, one span entry per
+                     // population
+                     std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
+                     std::vector<fsgrids::speciesjspan>& speciesJ,
+                     // FIXME do we need a separate electric field here to, same as in the electrostatic case since the acceleration step does NOT take the regular efield span?
+#endif
                      fsgrids::dperbspan dperb,
                      fsgrids::dmomentsspan dmoments,
                      fsgrids::dmomentsspan dmomentsdt2,

@@ -3,6 +3,9 @@
 #ifdef FS_ES
 # include "es_main.h"
 #endif
+#ifdef FS_AP
+# include "ap_electric_field.hpp"
+#endif
 
 /*! \brief Top-level field propagation function.
  *
@@ -25,6 +28,10 @@ bool propagateFields(fsgrids::perbspan perb,
 #endif
                     fsgrids::momentsspan moments,
                     fsgrids::momentsspan momentsdt2,
+#ifdef FS_AP
+                    std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
+                    std::vector<fsgrids::speciesjspan>& speciesJ,
+#endif
                     fsgrids::dperbspan dperb,
                     fsgrids::dmomentsspan dmoments,
                     fsgrids::dmomentsspan dmomentsdt2,
@@ -50,6 +57,14 @@ bool propagateFields(fsgrids::perbspan perb,
          return es_propagateFields(e_es, Phi, moments, momentsdt2, technical, fsgrid, sysBoundaries, dt, subcycles);
       # else
          fprintf(stderr, "Electrostatic field solver selected by P::fieldSolverMethod but FS_ES was not defined at compile time\n");
+         abort();
+      # endif
+   } else if (P::fieldSolverMethod == "AP") {
+      # ifdef FS_AP
+         // fprintf(stderr, "Implicit electromagnetic field solver selected by P::fieldSolverMethod\n");
+         return ap_propagateFields(perb, perbdt2, e, edt2, moments, speciesRhoQ, speciesJ, dperb, bgb, vol, technical, fsgrid, dt, subcycles);
+      # else
+         fprintf(stderr, "Implicit electromagnetic field solver selected by P::fieldSolverMethod but FS_AP was not defined at compile time\n");
          abort();
       # endif
    } else {

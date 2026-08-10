@@ -330,6 +330,21 @@ namespace fsgrids {
       N_MOMENTS
    };
 
+   #ifdef FS_AP
+   enum speciesrhoq {
+      SRHOQ, /*!< Per-species charge density rho_s = q_s * n_s. */
+      N_SPECIES_RHOQ
+   };
+
+   /*! per-species current density J_s^{k*} = rho_s * u_s. */
+   enum speciesj {
+      SJX, /*!< Per-species current density x-component. */
+      SJY, /*!< Per-species current density y-component. */
+      SJZ, /*!< Per-species current density z-component. */
+      N_SPECIES_J
+   };
+   #endif
+
    enum dperb {
       dPERBxdy,     /*!< Derivative of face-averaged Bx to y-direction. */
       dPERBxdz,     /*!< Derivative of face-averaged Bx to z-direction. */
@@ -463,6 +478,12 @@ namespace fsgrids {
    typedef std::span<std::array<Real, fsgrids::potential::N_POTENTIAL>> potentialspan;
    typedef std::span<const std::array<Real, fsgrids::potential::N_POTENTIAL>> constpotentialspan;
    #endif
+   #ifdef FS_AP
+   typedef std::span<std::array<Real, fsgrids::speciesrhoq::N_SPECIES_RHOQ>> speciesrhoqspan;
+   typedef std::span<const std::array<Real, fsgrids::speciesrhoq::N_SPECIES_RHOQ>> constspeciesrhoqspan;
+   typedef std::span<std::array<Real, fsgrids::speciesj::N_SPECIES_J>> speciesjspan;
+   typedef std::span<const std::array<Real, fsgrids::speciesj::N_SPECIES_J>> constspeciesjspan;
+   #endif
    typedef std::span<technical> technicalspan;
    typedef std::span<const technical> consttechnicalspan;
 
@@ -587,6 +608,7 @@ namespace physicalconstants {
    const Real MASS_ELECTRON = 9.10938188e-31; /**< Electron rest mass, units: kg.*/
    const Real MASS_PROTON = 1.67262158e-27; /*!< Proton rest mass, units: kg.*/
    const Real R_E = 6.3712e6; /*!< radius of the Earth, units: m. */
+   const Real LIGHT_SPEED = 299792458.0; /*!< Speed of light in vacuum, units: m/s. */
 }
 
 const std::vector<CellID>& getLocalCells();

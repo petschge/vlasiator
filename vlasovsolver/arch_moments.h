@@ -73,8 +73,8 @@ void calculateMoments_V(
  * velocity block and add results to 'array', which must have at
  * least size four. After this function returns, the contents of
  * 'array' are as follows: array[0]=n; array[1]=n*Vx; array[2]=nVy;
- * array[3]=nVz; Here n is the scaled number density, i.e., number density
- * times population mass / proton mass. This function is AMR safe.
+ * array[3]=nVz;
+ * This function is AMR safe.
  * @param data Distribution functions
  * @param blockParameters Parameters for the velocity blocks
  * @param array Array where the calculated moments are added

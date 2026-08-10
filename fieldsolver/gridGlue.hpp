@@ -57,6 +57,7 @@ enum FieldsToCommunicate {
 std::vector<CellID> mapDccrgIdToFsGridGlobalID(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
 					       CellID dccrgID);
 
+#ifdef FS_AP
 /*! Take input moments from DCCRG grid and put them into the Fieldsolver grid
  * \param mpiGrid The DCCRG grid carrying rho, rhoV and P
  * \param cells List of local cells
@@ -64,6 +65,7 @@ std::vector<CellID> mapDccrgIdToFsGridGlobalID(dccrg::Dccrg<SpatialCell,dccrg::C
  * \param technical fsgrid with technical parameters
  * \param fsgrid fsgrid container
  * \param dt2 Whether to copy base moments, or _DT2 moments
+ * FIXME: do we need the dt2 parameter ever?
  *
  * This function assumes that proper grid coupling has been set up.
  */
@@ -71,6 +73,26 @@ void feedMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>&
                            const std::vector<CellID>& cells,
                            fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& moments,
                            fsgrids::technicalspan technical, FieldSolverGrid &fsgrid, bool dt2 = false);
+
+/*! Take per-species rho_s^k / J_s^{k*} from DCCRG-side flat
+ * arrays and put them into per-population Fieldsolver-grid arrays.
+ * \param mpiGrid       The DCCRG grid for its coupling maps
+ * \param cells         List of local cells, in the SAME order used to
+ *                      populate speciesRhoQ/speciesJ
+ * \param speciesRhoQ   Per-population, per-cell charge density rho_s^k:
+ *                      speciesRhoQ[popID][index into cells].
+ * \param speciesJ      Per-population, per-cell current density J_s^{k*}:
+ *                      speciesJ[popID][index into cells].
+ * \param fsSpeciesRhoQ output as one span per population
+ * \param fsSpeciesJ    outout as one span per population
+ */
+void feedSpeciesMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,
+                           const std::vector<CellID>& cells,
+                           const std::vector<std::vector<Real>>& speciesRhoQ,
+                           const std::vector<std::vector<std::array<Real,3>>>& speciesJ,
+                           std::vector<fsgrids::speciesrhoqspan>& fsSpeciesRhoQ,
+                           std::vector<fsgrids::speciesjspan>& fsSpeciesJ);
+#endif
 
 /*! Copy field solver result (VOLB, VOLE, VOLPERB derivatives, gradpe) and store them back into DCCRG
  * \param volumefields fsgrid for volume-averaged fields

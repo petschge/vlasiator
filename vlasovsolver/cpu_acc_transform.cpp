@@ -56,8 +56,17 @@ void updateAccelerationMaxdt(
 
 
 /*!
- Compute transform during on timestep, and update the bulk velocity of the
- cell
+ Compute the affine (rotation + translation) transform representing the
+ velocity-space Lorentz-force push over one subcycle substep, per Liu et al.
+ 2025 Eq. (20):
+
+   v -> v - (q/m)(E^{k+theta} + v x B^{k+theta}) dt
+
+ the combined rotation+translation is built up from many small substeps (0.1
+ deg of gyration each) rather than in one step, so that the E x B drift is
+ captured to good accuracy even when dt corresponds to many degrees of
+ gyration.
+
  * @param spatial_cell Spatial cell containing the accelerated population.
  * @param popID ID of the accelerated particle species.
  * @param dt Time step of one subcycle.
@@ -71,20 +80,6 @@ Eigen::Transform<Real,3,Eigen::Affine> compute_acceleration_transformation(
    const Real Bx = spatial_cell->parameters[CellParams::BGBXVOL]+spatial_cell->parameters[CellParams::PERBXVOL];
    const Real By = spatial_cell->parameters[CellParams::BGBYVOL]+spatial_cell->parameters[CellParams::PERBYVOL];
    const Real Bz = spatial_cell->parameters[CellParams::BGBZVOL]+spatial_cell->parameters[CellParams::PERBZVOL];
-
-   // perturbed field
-   //const Real perBx = spatial_cell->parameters[CellParams::PERBXVOL];
-   //const Real perBy = spatial_cell->parameters[CellParams::PERBYVOL];
-   //const Real perBz = spatial_cell->parameters[CellParams::PERBZVOL];
-
-   // read in derivatives need for curl of B (only perturbed, curl of background field is always 0!)
-   const Real dBXdy = spatial_cell->derivativesBVOL[bvolderivatives::dPERBXVOLdy];
-   const Real dBXdz = spatial_cell->derivativesBVOL[bvolderivatives::dPERBXVOLdz];
-   const Real dBYdx = spatial_cell->derivativesBVOL[bvolderivatives::dPERBYVOLdx];
-
-   const Real dBYdz = spatial_cell->derivativesBVOL[bvolderivatives::dPERBYVOLdz];
-   const Real dBZdx = spatial_cell->derivativesBVOL[bvolderivatives::dPERBZVOLdx];
-   const Real dBZdy = spatial_cell->derivativesBVOL[bvolderivatives::dPERBZVOLdy];
 
    const Eigen::Matrix<Real,3,1> B(Bx,By,Bz);
    Eigen::Matrix<Real,3,1> unit_B(B.normalized());
@@ -100,60 +95,38 @@ Eigen::Transform<Real,3,Eigen::Affine> compute_acceleration_transformation(
      = 2 * M_PI * getObjectWrapper().particleSpecies[popID].mass
      / (getObjectWrapper().particleSpecies[popID].charge * B_mag);
 
-   // scale rho for hall term, if user requests
-   const Real EPSILON = 1e10 * numeric_limits<Real>::min();
-   const Real rhoq = spatial_cell->parameters[CellParams::RHOQ_V] + EPSILON;
-   const Real hallRhoq =  (rhoq <= Parameters::hallMinimumRhoq ) ? Parameters::hallMinimumRhoq : rhoq ;
-   const Real hallPrefactor = 1.0 / (physicalconstants::MU_0 * hallRhoq );
-
-   Eigen::Matrix<Real,3,1> bulk_velocity(spatial_cell->parameters[CellParams::VX_V],
-                                         spatial_cell->parameters[CellParams::VY_V],
-                                         spatial_cell->parameters[CellParams::VZ_V]);
+   // E^{k+theta}, solved from Eq. (38)
+   const Eigen::Matrix<Real,3,1> E(spatial_cell->parameters[CellParams::EXVOL],
+                                   spatial_cell->parameters[CellParams::EYVOL],
+                                   spatial_cell->parameters[CellParams::EZVOL]);
 
    // compute total transformation
-   Transform<Real,3,Affine> total_transform(Matrix<Real, 4, 4>::Identity()); //CONTINUE
+   Transform<Real,3,Affine> total_transform(Matrix<Real, 4, 4>::Identity());
 
-   unsigned int bulk_velocity_substeps; // in this many substeps we iterate forward bulk velocity when the complete transformation is computed (0.1 deg per substep).
+   unsigned int bulk_velocity_substeps; // in this many substeps we iterate forward velocity when the complete transformation is computed (0.1 deg per substep).
    bulk_velocity_substeps = fabs(dt) / fabs(gyro_period*(0.1/360.0));
    if (bulk_velocity_substeps < 1) {
       bulk_velocity_substeps=1;
    }
 
    const Real substeps_radians = -(2.0*M_PI*dt/gyro_period)/bulk_velocity_substeps; // how many radians each substep is.
-   const Real substeps_dt=dt/bulk_velocity_substeps; /*!< how many s each substep is*/
+   const Real substeps_dt=dt/bulk_velocity_substeps;                                // how many s each substep is
    Eigen::Matrix<Real,3,1> EgradPe(
       spatial_cell->parameters[CellParams::EXGRADPE],
       spatial_cell->parameters[CellParams::EYGRADPE],
       spatial_cell->parameters[CellParams::EZGRADPE]);
-   Eigen::Matrix<Real,3,1> E_ES(
-      spatial_cell->parameters[CellParams::EX_ES],
-      spatial_cell->parameters[CellParams::EY_ES],
-      spatial_cell->parameters[CellParams::EZ_ES]);
 
    for (uint i=0; i<bulk_velocity_substeps; ++i) {
-      // rotation origin is the point through which we place our rotation axis (direction of which is unitB).
-      // first add bulk velocity (using the total transform computed this far.
-      Eigen::Matrix<Real,3,1> rotation_pivot(total_transform*bulk_velocity);
-
-      //include lorentzHallTerm (we should include, always)
-      rotation_pivot[0]-= hallPrefactor*(dBZdy - dBYdz);
-      rotation_pivot[1]-= hallPrefactor*(dBXdz - dBZdx);
-      rotation_pivot[2]-= hallPrefactor*(dBYdx - dBXdy);
-
-      // add to transform matrix the small rotation around  pivot
-      // when added like this, and not using *= operator, the transformations
-      // are in the correct order
-      total_transform = Translation<Real,3>(-rotation_pivot)*total_transform;
+      // v x B gyration: pure rotation around the B axis through the origin.
       total_transform = AngleAxis<Real>(substeps_radians,unit_B)*total_transform;
-      total_transform = Translation<Real,3>(rotation_pivot)*total_transform;
 
-      // Electron pressure gradient term
+      // Electron pressure gradient term, only for the old field solver
       if(Parameters::ohmGradPeTerm > 0) {
          total_transform=Translation<Real,3>( (fabs(getObjectWrapper().particleSpecies[popID].charge)/getObjectWrapper().particleSpecies[popID].mass) * EgradPe * substeps_dt) * total_transform;
       }
 
-      // electrostatic term
-      total_transform=Translation<Real,3>( (getObjectWrapper().particleSpecies[popID].charge/getObjectWrapper().particleSpecies[popID].mass) * E_ES * substeps_dt) * total_transform;
+      // Electric field acceleration, only or ES and AP field solver
+      total_transform=Translation<Real,3>( (getObjectWrapper().particleSpecies[popID].charge/getObjectWrapper().particleSpecies[popID].mass) * E * substeps_dt) * total_transform;
    }
 
    return total_transform;

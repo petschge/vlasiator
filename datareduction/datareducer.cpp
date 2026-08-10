@@ -159,14 +159,17 @@ void initializeDataReducers(DataReducer * outputReducer, DataReducer * diagnosti
                   const auto lid = stencil.ooo();
                   const auto ri  = gridSize[1]*gridSize[0]*stencil.k + gridSize[0]*stencil.j + stencil.i;
 #ifdef FS_ES
-                  retval[3*ri]   = fieldSolverData.E_ES[lid][fsgrids::efield::EX];
-                  retval[3*ri+1] = fieldSolverData.E_ES[lid][fsgrids::efield::EY];
-                  retval[3*ri+2] = fieldSolverData.E_ES[lid][fsgrids::efield::EZ];
-#else
-                  retval[3*ri]   = fieldSolverData.E[lid][fsgrids::efield::EX];
-                  retval[3*ri+1] = fieldSolverData.E[lid][fsgrids::efield::EY];
-                  retval[3*ri+2] = fieldSolverData.E[lid][fsgrids::efield::EZ];
+                  if (P::fieldSolverMethod == "ES") {
+                     retval[3*ri]   = fieldSolverData.E_ES[lid][fsgrids::efield::EX];
+                     retval[3*ri+1] = fieldSolverData.E_ES[lid][fsgrids::efield::EY];
+                     retval[3*ri+2] = fieldSolverData.E_ES[lid][fsgrids::efield::EZ];
+                  } else
 #endif
+                  {
+                     retval[3*ri]   = fieldSolverData.E[lid][fsgrids::efield::EX];
+                     retval[3*ri+1] = fieldSolverData.E[lid][fsgrids::efield::EY];
+                     retval[3*ri+2] = fieldSolverData.E[lid][fsgrids::efield::EZ];
+                  }
                });
                return retval;
          }

@@ -234,6 +234,58 @@ void computeNewTimeStep(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mp
    }
 }
 
+/** Capture per-population charge density rho_s^k = q_s * n_s from the
+ * currently valid "_R" moment slot for every particle species into a
+ * per-cell/per-population array.
+ *
+ * @param mpiGrid   Parallel grid library.
+ * @param cells     Local cells to process
+ * @param outRhoQ   Output, resized here: outRhoQ[popID][cell]
+ */
+void captureSpeciesChargeDensity(
+   dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
+   const vector<CellID>& cells,
+   vector<vector<Real>>& outRhoQ
+) {
+   const uint numPops = getObjectWrapper().particleSpecies.size();
+   outRhoQ.assign(numPops, vector<Real>(cells.size(), 0.0));
+
+   for (uint popID=0; popID<numPops; ++popID) {
+      const Real charge = getObjectWrapper().particleSpecies[popID].charge;
+      #pragma omp parallel for
+      for (size_t c=0; c<cells.size(); ++c) {
+         spatial_cell::Population& pop = mpiGrid[cells[c]]->get_population(popID);
+         outRhoQ[popID][c] = charge * pop.RHO_R;
+      }
+   }
+}
+
+/** Capture per-population current density J_s^{k*} = rho_s * u_s from the "_R"
+ * moment slot when it hold f*'s moments.
+ *
+ * @param outJ   Output, resized here: outJ[popID][c] = {Jx,Jy,Jz} at cells[c].
+ */
+void captureSpeciesCurrentDensity(
+   dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
+   const vector<CellID>& cells,
+   vector<vector<std::array<Real,3>>>& outJ
+) {
+   const uint numPops = getObjectWrapper().particleSpecies.size();
+   outJ.assign(numPops, vector<std::array<Real,3>>(cells.size(), {0.0,0.0,0.0}));
+
+   for (uint popID=0; popID<numPops; ++popID) {
+      const Real charge = getObjectWrapper().particleSpecies[popID].charge;
+      #pragma omp parallel for
+      for (size_t c=0; c<cells.size(); ++c) {
+         spatial_cell::Population& pop = mpiGrid[cells[c]]->get_population(popID);
+         const Real rhoQ = charge * pop.RHO_R;
+         outJ[popID][c][0] = rhoQ * pop.V_R[0];
+         outJ[popID][c][1] = rhoQ * pop.V_R[1];
+         outJ[popID][c][2] = rhoQ * pop.V_R[2];
+      }
+   }
+}
+
 int simulate(int argn,char* args[]) {
    int myRank, doBailout=0;
    const creal DT_EPSILON=1e-12;
@@ -474,6 +526,17 @@ int simulate(int argn,char* args[]) {
 #endif
    fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>> moments(fsgridNumElements);
    fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>> momentsdt2(fsgridNumElements);
+#ifdef FS_AP
+   // per-species rho_s^k / J_s^{k*} on the fsgrid side: one
+   // FsData object per population, since species count is a
+   // runtime quantity
+   std::vector<fsgrid::FsData<std::array<Real, fsgrids::speciesrhoq::N_SPECIES_RHOQ>>> fsSpeciesRhoQ;
+   std::vector<fsgrid::FsData<std::array<Real, fsgrids::speciesj::N_SPECIES_J>>> fsSpeciesJ;
+   for (uint popID=0; popID<getObjectWrapper().particleSpecies.size(); ++popID) {
+      fsSpeciesRhoQ.emplace_back(fsgridNumElements);
+      fsSpeciesJ.emplace_back(fsgridNumElements);
+   }
+#endif
    fsgrid::FsData<std::array<Real, fsgrids::dperb::N_DPERB>> dperb(fsgridNumElements);
    fsgrid::FsData<std::array<Real, fsgrids::dmoments::N_DMOMENTS>> dmoments(fsgridNumElements);
    fsgrid::FsData<std::array<Real, fsgrids::dmoments::N_DMOMENTS>> dmomentsdt2(fsgridNumElements);
@@ -536,7 +599,7 @@ int simulate(int argn,char* args[]) {
       ehall,
       egradpe,
       egradpedt2,
-#if FS_ES
+#ifdef FS_ES
       e_es,
       Phi,
 #endif
@@ -622,6 +685,13 @@ int simulate(int argn,char* args[]) {
    // Fieldsolver dt limits, and also calculate volumetric B-fields.
    // At restart, all we need at this stage has been read from the restart, the rest will be recomputed in due time.
    if(P::isRestart == false) {
+#ifdef FS_AP
+      std::vector<fsgrids::speciesrhoqspan> speciesRhoQView;
+      std::vector<fsgrids::speciesjspan> speciesJView;
+      for (auto& x : fsSpeciesRhoQ) { speciesRhoQView.push_back(x.view()); }
+      for (auto& x : fsSpeciesJ)    { speciesJView.push_back(x.view()); }
+#endif
+
       propagateFields(
          perb.view(),
          perbdt2.view(),
@@ -636,6 +706,10 @@ int simulate(int argn,char* args[]) {
 #endif
          moments.view(),
          momentsdt2.view(),
+#ifdef FS_AP
+         speciesRhoQView,
+         speciesJView,
+#endif
          dperb.view(),
          dmoments.view(),
          dmomentsdt2.view(),
@@ -654,6 +728,7 @@ int simulate(int argn,char* args[]) {
                        e_es.view(),
 #endif
                        dmoments.view(), technical.view(), fsgrid, mpiGrid, cells);
+
    getFieldsTimer.stop();
 
    // Build communicator for ionosphere solving
@@ -755,21 +830,19 @@ int simulate(int argn,char* args[]) {
       }
       computeDtTimer.stop();
 
-      //go forward by dt/2 in V, initializes leapfrog split. In restarts the
-      //the distribution function is already propagated forward in time by dt/2
-      phiprof::Timer propagateHalfTimer {"propagate-velocity-space-dt/2"};
-      if (P::propagateVlasovAcceleration) {
-         calculateAcceleration(mpiGrid, 0.5*P::dt);
-      } else {
-         //zero step to set up moments _v
-         calculateAcceleration(mpiGrid, 0.0);
-      }
+      // The new translate-accelerate-translate timestepping does not have
+      // persistent time offsets carried across iterations, so unlike the old
+      // leapfrog scheme there is nothing to initialize here: f is still
+      // exactly f^0. This call is only to (re-)populate moments consistent
+      // with that unperturbed state before the first step's translation.
+      phiprof::Timer propagateHalfTimer {"initialize-moments-from-f0"};
+      calculateAcceleration(mpiGrid, 0.0);
       propagateHalfTimer.stop();
 
       // Apply boundary conditions
       if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
          phiprof::Timer updateBoundariesTimer {("update system boundaries (Vlasov post-acceleration)")};
-         sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, 0.5*P::dt, true);
+         sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, 0.0*P::dt, true);
          updateBoundariesTimer.stop();
          addTimedBarrier("barrier-boundary-conditions");
       }
@@ -843,6 +916,16 @@ int simulate(int argn,char* args[]) {
    int doNow[donow::N_DONOW] = {0}; // 0: writeRestartNow, 1: writeRecoverNow, 2: balanceLoadNow, 3: refineNow ; declared outside main loop
    bool overrideRebalanceNow = false; // declared outside main loop
    bool refineNow = false; // declared outside main loop
+
+   // Asymptotics Preserving (Liu et al. 2025) timestepping: the Vlasov push is
+   // now a cycle of translate(FieldSolverTheta*dt) -- field solve -- accelerate(dt) --
+   // translate((1-FieldSolverTheta)*dt)
+
+   // per-species moment ingredients
+#ifdef FS_AP
+   vector<vector<Real>> speciesRhoQ_k;                 // [popID][cellIndex], rho_s^k
+   vector<vector<std::array<Real,3>>> speciesJ_kstar;  // [popID][cellIndex], J_s^{k*}
+#endif
 
    addTimedBarrier("barrier-end-initialization");
 
@@ -952,7 +1035,7 @@ int simulate(int argn,char* args[]) {
                    writeGhosts
                ) == false
             ) {
-               cerr << "FAILED TO WRITE GRID AT" << __FILE__ << " " << __LINE__ << endl;
+               cerr << "FAILED TO WRITE GRID AT " << __FILE__ << " " << __LINE__ << endl;
             }
             P::systemWrites[i]++;
             // Special case for large timesteps
@@ -1167,6 +1250,13 @@ int simulate(int argn,char* args[]) {
       //simulation loop
       // FIXME what if dt changes at a restart??
       if(P::dynamicTimestep  && P::tstep > P::tstep_min) {
+         // This block adjusts the leapfrog dt/2 offset when dt changes.
+         // That only applies to the old leapfrog scheme and not to the new
+         // implicit fieldsolver with translate-accelerate-translate cycle
+         stringstream s;
+         s << "The AP (CSL-RME) timestepping scheme currently requires a fixed dt" << endl;
+         bailout(true, s.str(), __FILE__, __LINE__);
+
          computeNewTimeStep(mpiGrid, technical.view(), fsgrid, newDt, dtIsChanged);
          addTimedBarrier("barrier-check-dt");
          if(dtIsChanged) {
@@ -1231,9 +1321,18 @@ int simulate(int argn,char* args[]) {
          addTimedBarrier("barrier-boundary-conditions");
       }
 
+      // Capture rho_s^k (per species) before anything moves this step: _R
+      // still holds exactly f^k, left over from last iteration's closing
+      // (1-FieldSolverTheta)*dt translation
+#ifdef FS_AP
+      captureSpeciesChargeDensity(mpiGrid, cells, speciesRhoQ_k);
+#endif
+
+      // First part of the translation-acceleration-translation cycle: theta*dt
+      // of real space transport, bringing f to f*
       phiprof::Timer spatialSpaceTimer {"Spatial-space"};
       if( P::propagateVlasovTranslation) {
-         calculateSpatialTranslation(mpiGrid,P::dt);
+         calculateSpatialTranslation(mpiGrid, P::FieldSolverTheta*P::dt);
       } else {
          calculateSpatialTranslation(mpiGrid,0.0);
       }
@@ -1246,6 +1345,11 @@ int simulate(int argn,char* args[]) {
          timer.stop();
          addTimedBarrier("barrier-boundary-conditions");
       }
+
+      // Capture J_s^{k*} (per species) now that_R moments holds exactly f*'s moments.
+#ifdef FS_AP
+      captureSpeciesCurrentDensity(mpiGrid, cells, speciesJ_kstar);
+#endif
 
       phiprof::Timer momentsTimer {"Compute interp moments"};
       calculateInterpolatedVelocityMoments(
@@ -1270,9 +1374,17 @@ int simulate(int argn,char* args[]) {
          phiprof::Timer propagateTimer {"Propagate Fields"};
 
          phiprof::Timer couplingInTimer {"fsgrid-coupling-in"};
+#ifdef FS_AP
          // Copy moments over into the fsgrid.
          feedMomentsIntoFsGrid(mpiGrid, cells, moments, technical.view(), fsgrid, false);
          feedMomentsIntoFsGrid(mpiGrid, cells, momentsdt2, technical.view(), fsgrid, true);
+         // Copy the per-species rho_s^k / J_s^{k*} over into the fsgrid.
+         std::vector<fsgrids::speciesrhoqspan> speciesRhoQView;
+         std::vector<fsgrids::speciesjspan> speciesJView;
+         for (auto& x : fsSpeciesRhoQ) { speciesRhoQView.push_back(x.view()); }
+         for (auto& x : fsSpeciesJ)    { speciesJView.push_back(x.view()); }
+         feedSpeciesMomentsIntoFsGrid(mpiGrid, cells, speciesRhoQ_k, speciesJ_kstar, speciesRhoQView, speciesJView);
+#endif
          // Update the spans of the filtered grids that were swapped in filtering
          if (P::amrMaxSpatialRefLevel > 0) {
             fieldSolverData.moments = moments.view();
@@ -1294,6 +1406,10 @@ int simulate(int argn,char* args[]) {
 #endif
             moments.view(),
             momentsdt2.view(),
+#ifdef FS_AP
+            speciesRhoQView,
+            speciesJView,
+#endif
             dperb.view(),
             dmoments.view(),
             dmomentsdt2.view(),
@@ -1375,6 +1491,23 @@ int simulate(int argn,char* args[]) {
       if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
          phiprof::Timer timer {"Update system boundaries (Vlasov post-acceleration)"};
          sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, P::t + 0.5 * P::dt, true);
+         timer.stop();
+         addTimedBarrier("barrier-boundary-conditions");
+      }
+
+      // Last part of the translate-accelerate-translate cycle: (1-theta)*dt of
+      // real space advection
+      spatialSpaceTimer.start();
+      if( P::propagateVlasovTranslation) {
+         calculateSpatialTranslation(mpiGrid, (1.0-P::FieldSolverTheta)*P::dt);
+      } else {
+         calculateSpatialTranslation(mpiGrid,0.0);
+      }
+      spatialSpaceTimer.stop(computedCells, "Cells");
+
+      if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
+         phiprof::Timer timer {"Update system boundaries (Vlasov post-translation)"};
+         sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, P::t + 0.5 * P::dt, false);
          timer.stop();
          addTimedBarrier("barrier-boundary-conditions");
       }
