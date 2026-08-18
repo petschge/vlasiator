@@ -4,7 +4,6 @@ import numpy as np
 import analysator
 import matplotlib.pyplot as plt
 import os
-from bernstein import bernstein_root_in_bracket
 import argparse
 
 
@@ -16,13 +15,79 @@ parser.add_argument("--title",
                     type=str,
                     default="",
                     help="Title above all plots (default: %(default)s)")
+parser.add_argument("--cmap",
+                    dest="cmap",
+                    action="store",
+                    type=str,
+                    default="viridis",
+                    help="Name of matplotlib color map to use (default: %(default)s)")
+parser.add_argument("--freqnorm",
+                    dest="freqnorm",
+                    action="store",
+                    type=str,
+                    default="wpe",
+                    help="Frequency used for normalization (wpe|wpi|Wce|Wci) (default: %(default)s)")
+parser.add_argument("--lengthnorm",
+                    dest="lengthnorm",
+                    action="store",
+                    type=str,
+                    default="lD",
+                    help="Length scale used for normalization (lD|re|ri|de|di) (default: %(default)s)")
+parser.add_argument("--kmax",
+                    dest="kmax",
+                    action="store",
+                    type=str,
+                    default="",
+                    help="Maximum k value (default: %(default)s)")
+parser.add_argument("--wmax",
+                    dest="wmax",
+                    action="store",
+                    type=str,
+                    default="",
+                    help="Maximum frequency value (default: %(default)s)")
+parser.add_argument("--cbrange",
+                    dest="cbrange",
+                    action="store",
+                    type=int,
+                    default=10,
+                    help="Order of magnitude between cbmin and cmax (default: %(default)s)")
+parser.add_argument("--onlyE",
+                    dest="onlyE",
+                    action="store_true",
+                    help="plot only electric fields (default: %(default)s)")
+parser.add_argument("--decimate",
+                    dest="decimate",
+                    action="store",
+                    type=int,
+                    default=1,
+                    help="Read every N.th timestep (default: %(default)s)")
+parser.add_argument("--limit",
+                    dest="limit",
+                    action="store",
+                    type=float,
+                    default=1.,
+                    help="Read the first 1/N of timesteps (default: %(default)s)")
+parser.add_argument("--elec-bernstein",
+                    dest="elec_bernstein",
+                    action="store_true",
+                    help="plot expectation for Electron bernstein modes (default: %(default)s)")
 parser.add_argument("dirname",
                     nargs='*',
                     action="store",
                     type=str,
                     default=".",
                     help="Simulation directory (default: %(default)s)")
+
 args = parser.parse_args()
+
+if args.elec_bernstein:
+    from bernstein import bernstein_root_in_bracket
+
+if len(args.dirname) != 1:
+    sys.stderr(args.dirname+" is a list with more than one entry. That doesn't work currently. Please make separate calls to this tool\n")
+    sys.exit(1)
+else:
+    args.dirname = args.dirname[0]
 
 
 # load environment
@@ -77,8 +142,13 @@ timesteps = []
 for filename in glob.glob(args.dirname+"/bulk*vlsv"):
     parts = filename.split("/")[-1].split(".")
     if len(parts) == 3:
-        timesteps.append(int(parts[1]))
+        t = int(parts[1])
+        if t%args.decimate == 0:
+            timesteps.append(t)
 timesteps.sort()
+if args.limit > 1.:
+    timesteps = timesteps[:int(len(timesteps)/args.limit)]
+
 tsize = len(timesteps)
 
 # collection of output quantities present in the files
@@ -188,13 +258,21 @@ for i,t in enumerate(timesteps[:1]):
     else:
         have_ni = False
 
+if args.onlyE:
+    have_B = False
+    have_Phi = False
+    have_rho = False
+    have_Eje = False
+    have_ne = False
+    have_ni = False
+
 # Report what we found in the file
 print("Found field grid with "+str(xsize)+"x"+str(ysize)+"x"+str(zsize)+" cells")
 
 dt = f.read_parameter("dt")
 config=f.get_config()
 
-dtout = float(config["io"]["system_write_t_interval"][0])
+dtout = args.decimate * float(config["io"]["system_write_t_interval"][0])
 if dt > dtout:
     dtout = dt
 xmin = f.read_parameter("xmin")
@@ -402,16 +480,61 @@ if have_E:
 
 print("Plotting data")
 
-freqnorm = wpe
-if have_latex:
-    freqnormlabel = r"$\omega_{pe}$"
-else:
-    freqnormlabel = "w_pe"
-lengthnorm = lD
-if have_latex:
-    lengthnormlabel = r"$\lambda_D$"
-else:
-    lengthnormlabel = "l_D"
+if args.freqnorm == "wpe":
+    freqnorm = wpe
+    if have_latex:
+        freqnormlabel = r"$\omega_{pe}$"
+    else:
+        freqnormlabel = "w_pe"
+elif args.freqnorm == "wpi":
+    freqnorm = wpi
+    if have_latex:
+        freqnormlabel = r"$\omega_{pi}$"
+    else:
+        freqnormlabel = "w_pi"
+elif args.freqnorm == "Wce":
+    freqnorm = Wce
+    if have_latex:
+        freqnormlabel = r"$\Omega_{ce}$"
+    else:
+        freqnormlabel = "W_ce"
+elif args.freqnorm == "Wci":
+    freqnorm = Wci
+    if have_latex:
+        freqnormlabel = r"$\Omega_{ci}$"
+    else:
+        freqnormlabel = "W_ci"
+
+if args.lengthnorm == "lD":
+    lengthnorm = lD
+    if have_latex:
+        lengthnormlabel = r"$\lambda_D$"
+    else:
+        lengthnormlabel = "l_D"
+elif args.lengthnorm == "re":
+    lengthnorm = re
+    if have_latex:
+        lengthnormlabel = r"$r_e$"
+    else:
+        lengthnormlabel = "r_e"
+elif args.lengthnorm == "ri":
+    lengthnorm = ri
+    if have_latex:
+        lengthnormlabel = r"$r_i$"
+    else:
+        lengthnormlabel = "r_i"
+elif args.lengthnorm == "de":
+    lengthnorm = de
+    if have_latex:
+        lengthnormlabel = r"$d_e$"
+    else:
+        lengthnormlabel = "d_e"
+elif args.lengthnorm == "di":
+    lengthnorm = di
+    if have_latex:
+        lengthnormlabel = r"$d_i$"
+    else:
+        lengthnormlabel = "d_i"
 
 total = 0
 if have_B:
@@ -441,12 +564,13 @@ if have_ni:
 if have_tqdm:
     pbar = tqdm(total=total)
 
-maxbernstein = 10
-kbernstein = np.linspace(0.0, np.pi/dx, xsize+1)[1:]
-omegabernstein = np.zeros( (len(kbernstein), maxbernstein) )
-for i in range(maxbernstein):
-    omegabernstein[:,i] =  np.array([bernstein_root_in_bracket(k, i, Wce, lD, re, order=2*maxbernstein)
-                                     for k in kbernstein])
+if args.elec_bernstein:
+    maxbernstein = 10
+    kbernstein = np.linspace(0.0, np.pi/dx, xsize+1)[1:]
+    omegabernstein = np.zeros( (len(kbernstein), maxbernstein) )
+    for i in range(maxbernstein):
+        omegabernstein[:,i] =  np.array([bernstein_root_in_bracket(k, i, Wce, lD, re, order=2*maxbernstein)
+                                         for k in kbernstein])
 
 # plot everything we have loaded and computed
 for variablecode,variable in variables.items():
@@ -465,7 +589,7 @@ for variablecode,variable in variables.items():
             X = np.linspace(xmin, xmax, xsize)
             T = np.linspace(timesteps[0], timesteps[-1], len(timesteps))
             vmax = np.amax(abs(variable[:,:,c].real))
-            im = plt.pcolormesh(X/lengthnorm, T*dtout*freqnorm, variable[:,:,c].real, shading="gouraud")#, vmin=-vmax, vmax=vmax)
+            im = plt.pcolormesh(X/lengthnorm, T*dtout*freqnorm, variable[:,:,c].real, shading="gouraud", cmap=args.cmap)#, vmin=-vmax, vmax=vmax)
             if have_latex:
                 labelstr = variablename[variablecode]+"$_{"+componentnames[c]+r"} \,/\, $"+variableunit[variablecode]
             else:
@@ -533,9 +657,9 @@ for variablecode,variable in variables.items():
             power[:,:] = 1e-80
 
         vmax = np.ceil(np.log10(np.amax(power)))
-        vmin = vmax - 10
+        vmin = vmax - args.cbrange
 
-        im = plt.pcolormesh(kx*lengthnorm, w/freqnorm, np.log10(power), shading='gouraud', vmin=vmin, vmax=vmax)
+        im = plt.pcolormesh(kx*lengthnorm, w/freqnorm, np.log10(power), shading='gouraud', vmin=vmin, vmax=vmax, cmap=args.cmap)
         if have_latex:
             labelstr=r"$\log \left|\tilde{$"+variablename[variablecode]+"$}_{"+componentnames[c]+r"}\right|^2$"
             labelstr=labelstr.replace("$$", "")
@@ -553,8 +677,9 @@ for variablecode,variable in variables.items():
         plt.plot( krighthf*lengthnorm, wrighthf/freqnorm, color="green", linestyle=":")
         plt.plot(-krighthf*lengthnorm, wrighthf/freqnorm, color="green", linestyle=":")
 
-        for i in range(maxbernstein):
-            plt.plot(kbernstein*lengthnorm, omegabernstein[:,i]/freqnorm, color="white", linestyle=":")
+        if args.elec_bernstein:
+            for i in range(maxbernstein):
+                plt.plot(kbernstein*lengthnorm, omegabernstein[:,i]/freqnorm, color="white", linestyle=":")
 
         if Wci > 0.:
             plt.axhline(Wci/freqnorm, color="cyan", linestyle=":", linewidth=0.5, label="W_ci")
@@ -568,12 +693,21 @@ for variablecode,variable in variables.items():
         else:
             plt.xlabel("k_x "+lengthnormlabel)
             plt.ylabel("w / "+freqnormlabel)
-        #plt.xlim(-0.5/ri*lengthnorm, 0.5/ri*lengthnorm)
-        #plt.ylim(   0., 1.5*Wci/freqnorm)
-        #plt.xlim(kx[0]*lengthnorm, kx[-1]*lengthnorm)
-        plt.xlim(-1.5/lD*lengthnorm, 1.5/lD*lengthnorm)
-        plt.ylim(   0.,  3.*wpe/freqnorm)
-        #plt.ylim(   0.,  1.2*Wci/freqnorm)
+
+        if args.kmax != "":
+            kmax = float(args.kmax)
+            plt.xlim(-kmax, kmax)
+        else:
+            #plt.xlim(kx[0]*lengthnorm, kx[-1]*lengthnorm)
+            plt.xlim(-1.5/lD*lengthnorm, 1.5/lD*lengthnorm)
+
+        if args.wmax != "":
+            wmax = float(args.wmax)
+            plt.ylim(0, wmax)
+        else:
+            #plt.ylim(   0., w[-1]/freqnorm)
+            plt.ylim(   0.,  3.*wpe/freqnorm)
+
         plt.legend()
         plt.tight_layout()
         imgname = args.dirname+"/k"+variablecode+componentnames[c]
@@ -591,7 +725,7 @@ for variablecode,variable in variables.items():
         if np.amax(spower) == 0.:
             spower[:,:] = 1e-80
         maskK = kx>=0.
-        im = plt.pcolormesh(T*dtout*freqnorm, kx[maskK]*lengthnorm, np.log10(spower[:,maskK].T), shading='gouraud')
+        im = plt.pcolormesh(T*dtout*freqnorm, kx[maskK]*lengthnorm, np.log10(spower[:,maskK].T), shading='gouraud', cmap=args.cmap)
         plt.colorbar(im, label=labelstr)
         if have_latex:
             plt.xlabel(r"$t \, $"+freqnormlabel)
