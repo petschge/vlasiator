@@ -46,6 +46,7 @@ void ap_BuildSpeciesTensors(
 bool ap_SolveElectricField(
    fsgrids::efieldspan e,
    fsgrids::efieldspan edt2,
+   fsgrids::constperbspan perb,
    fsgrids::constbgbspan bgb,
    fsgrids::constdperbspan dperb,
    const std::vector<std::array<Real,9>>& mu,

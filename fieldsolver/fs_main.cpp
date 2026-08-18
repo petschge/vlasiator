@@ -44,16 +44,9 @@ bool propagateFields(fsgrids::perbspan perb,
                     cuint subcycles) {
 
    if (P::fieldSolverMethod == "LDZ" || P::fieldSolverMethod == "default_fieldsolver") {
-      // if (P::fieldSolverMethod == "LDZ") {
-      //    fprintf(stderr, "LDZ field solver selected by P::fieldSolverMethod\n");
-      // } else if (P::fieldSolverMethod == "default_fieldsolver") {
-      //    fprintf(stderr, "LDZ field solver selected by default\n");
-      // }
       return ldz_propagateFields(perb, perbdt2, e, edt2, ehall, egradpe, egradpedt2, moments, momentsdt2, dperb, dmoments, dmomentsdt2, bgb, vol, technical, fsgrid, sysBoundaries, dt, subcycles);
-
    } else if (P::fieldSolverMethod == "ES") {
       # ifdef FS_ES
-         // fprintf(stderr, "Electrostatic field solver selected by P::fieldSolverMethod\n");
          return es_propagateFields(e_es, Phi, moments, momentsdt2, technical, fsgrid, sysBoundaries, dt, subcycles);
       # else
          fprintf(stderr, "Electrostatic field solver selected by P::fieldSolverMethod but FS_ES was not defined at compile time\n");
@@ -61,7 +54,6 @@ bool propagateFields(fsgrids::perbspan perb,
       # endif
    } else if (P::fieldSolverMethod == "AP") {
       # ifdef FS_AP
-         // fprintf(stderr, "Implicit electromagnetic field solver selected by P::fieldSolverMethod\n");
          return ap_propagateFields(perb, perbdt2, e, edt2, moments, speciesRhoQ, speciesJ, dperb, bgb, vol, technical, fsgrid, dt, subcycles);
       # else
          fprintf(stderr, "Implicit electromagnetic field solver selected by P::fieldSolverMethod but FS_AP was not defined at compile time\n");

@@ -225,7 +225,7 @@ void computeNewTimeStep(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mp
       subcycleDt = P::dt;
    }
 
-   // Subcycle if field solver dt < global dt (including CFL) (new or old dt hence the hassle with subcycleDt
+   // Subcycle if field solver dt < global dt (including CFL) (new or old dt hence the hassle with subcycleDt)
    if (meanFieldsCFL * dtMaxGlobal[2] < subcycleDt && P::propagateField) {
       P::fieldSolverSubcycles =
           min(convert<uint>(ceil(subcycleDt / (meanFieldsCFL * dtMaxGlobal[2]))), P::maxFieldSolverSubcycles);
@@ -234,6 +234,7 @@ void computeNewTimeStep(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mp
    }
 }
 
+#ifdef FS_AP
 /** Capture per-population charge density rho_s^k = q_s * n_s from the
  * currently valid "_R" moment slot for every particle species into a
  * per-cell/per-population array.
@@ -285,6 +286,7 @@ void captureSpeciesCurrentDensity(
       }
    }
 }
+#endif
 
 int simulate(int argn,char* args[]) {
    int myRank, doBailout=0;
@@ -366,6 +368,53 @@ int simulate(int argn,char* args[]) {
       }
       exit(1);
    }
+
+   // Check that the field solver selected at run time via P::fieldSolverMethod
+   // was actually compiled in. Picking a scheme that was not compiled in must
+   // fail loudly rather than silently.
+
+   if (P::fieldSolverMethod == "LDZ" || P::fieldSolverMethod == "default_fieldsolver") {
+      // Always available.
+      if (myRank == MASTER_RANK) {
+         if (P::fieldSolverMethod == "LDZ") {
+            cerr << "LDZ field solver selected by P::fieldSolverMethod" << endl;
+         } else if (P::fieldSolverMethod == "default_fieldsolver") {
+            cerr << "LDZ field solver selected by default" << endl;
+         }
+      }
+   } else if (P::fieldSolverMethod == "ES") {
+#ifdef FS_ES
+      if (myRank == MASTER_RANK) {
+         cerr << "Electrostatic field solver selected by P::fieldSolverMethod" << endl;
+      }
+#else
+      if (myRank == MASTER_RANK) {
+         cerr << "(MAIN) ERROR: Electrostatic (ES) field solver selected by P::fieldSolverMethod but FS_ES was not defined at compile time" << endl;
+      }
+      exit(1);
+#endif
+   } else if (P::fieldSolverMethod == "AP") {
+#ifdef FS_AP
+      if (myRank == MASTER_RANK) {
+         cerr << "Asymptotic-Preserving field solver selected by P::fieldSolverMethod" << endl;
+      }
+#else
+      if (myRank == MASTER_RANK) {
+         cerr << "(MAIN) ERROR: Asymptotic-Preserving (AP) field solver selected by P::fieldSolverMethod but FS_AP was not defined at compile time" << endl;
+      }
+      exit(1);
+#endif
+   } else {
+      if (myRank == MASTER_RANK) {
+         cerr << "(MAIN) ERROR: No viable field solver selected by P::fieldSolverMethod ('" << P::fieldSolverMethod << "')" << endl;
+      }
+      exit(1);
+   }
+   // From here on, P::fieldSolverMethod is known to name a compiled-in scheme, so the
+   // two flags below may be used freely without re-checking the string each time.
+   const bool fieldSolverIsLDZ = (P::fieldSolverMethod == "LDZ" || P::fieldSolverMethod == "default_fieldsolver");
+   const bool fieldSolverIsAP = (P::fieldSolverMethod == "AP");
+   const bool fieldSolverIsES = (P::fieldSolverMethod == "ES");
 
    // Verify correct handling of floating point exceptions
    // see https://github.com/fmihpc/vlasiator/pull/845
@@ -830,21 +879,41 @@ int simulate(int argn,char* args[]) {
       }
       computeDtTimer.stop();
 
-      // The new translate-accelerate-translate timestepping does not have
-      // persistent time offsets carried across iterations, so unlike the old
-      // leapfrog scheme there is nothing to initialize here: f is still
-      // exactly f^0. This call is only to (re-)populate moments consistent
-      // with that unperturbed state before the first step's translation.
-      phiprof::Timer propagateHalfTimer {"initialize-moments-from-f0"};
-      calculateAcceleration(mpiGrid, 0.0);
-      propagateHalfTimer.stop();
+      if (fieldSolverIsAP) {
+         // The asymptotic-preserving timestepping does not have persistent
+         // time offsets carried across iterations, so unlike the old leapfrog
+         // scheme there is nothing to initialize here: f is exactly f^0. This
+         // call is only to (re-)populate moments consistent with that
+         // unperturbed state before the first step's translation.
+         phiprof::Timer propagateHalfTimer {"initialize-moments-from-f0"};
+         calculateAcceleration(mpiGrid, 0.0);
+         propagateHalfTimer.stop();
 
-      // Apply boundary conditions
-      if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
-         phiprof::Timer updateBoundariesTimer {("update system boundaries (Vlasov post-acceleration)")};
-         sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, 0.0*P::dt, true);
-         updateBoundariesTimer.stop();
-         addTimedBarrier("barrier-boundary-conditions");
+         if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
+            phiprof::Timer updateBoundariesTimer {("update system boundaries (Vlasov post-acceleration)")};
+            sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, 0.0*P::dt, true);
+            updateBoundariesTimer.stop();
+            addTimedBarrier("barrier-boundary-conditions");
+         }
+      } else {
+         //go forward by dt/2 in V, initializes leapfrog split. In restarts the
+         //the distribution function is already propagated forward in time by dt/2
+         phiprof::Timer propagateHalfTimer {"propagate-velocity-space-dt/2"};
+         if (P::propagateVlasovAcceleration) {
+            calculateAcceleration(mpiGrid, 0.5*P::dt);
+         } else {
+            //zero step to set up moments _v
+            calculateAcceleration(mpiGrid, 0.0);
+         }
+         propagateHalfTimer.stop();
+
+         // Apply boundary conditions
+         if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
+            phiprof::Timer updateBoundariesTimer {("update system boundaries (Vlasov post-acceleration)")};
+            sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, 0.5*P::dt, true);
+            updateBoundariesTimer.stop();
+            addTimedBarrier("barrier-boundary-conditions");
+         }
       }
       // Also update all moments. They won't be transmitted to FSgrid until the field solver is called, though.
       phiprof::Timer computeMomentsTimer {"Compute interp moments"};
@@ -1250,12 +1319,14 @@ int simulate(int argn,char* args[]) {
       //simulation loop
       // FIXME what if dt changes at a restart??
       if(P::dynamicTimestep  && P::tstep > P::tstep_min) {
-         // This block adjusts the leapfrog dt/2 offset when dt changes.
-         // That only applies to the old leapfrog scheme and not to the new
-         // implicit fieldsolver with translate-accelerate-translate cycle
-         stringstream s;
-         s << "The AP (CSL-RME) timestepping scheme currently requires a fixed dt" << endl;
-         bailout(true, s.str(), __FILE__, __LINE__);
+         if (fieldSolverIsAP) {
+            // This block adjusts the leapfrog dt/2 offset when dt changes.
+            // That only applies to the old leapfrog scheme and not to the
+            // implicit fieldsolver with translate-accelerate-translate cycle.
+            stringstream s;
+            s << "The AP (CSL-RME) timestepping scheme currently requires a fixed dt" << endl;
+            bailout(true, s.str(), __FILE__, __LINE__);
+         }
 
          computeNewTimeStep(mpiGrid, technical.view(), fsgrid, newDt, dtIsChanged);
          addTimedBarrier("barrier-check-dt");
@@ -1321,18 +1392,27 @@ int simulate(int argn,char* args[]) {
          addTimedBarrier("barrier-boundary-conditions");
       }
 
-      // Capture rho_s^k (per species) before anything moves this step: _R
-      // still holds exactly f^k, left over from last iteration's closing
-      // (1-FieldSolverTheta)*dt translation
 #ifdef FS_AP
-      captureSpeciesChargeDensity(mpiGrid, cells, speciesRhoQ_k);
+      if (fieldSolverIsAP) {
+         // Capture rho_s^k (per species) before anything moves this step: _R
+         // still holds exactly f^k, left over from last iteration's closing
+         // (1-FieldSolverTheta)*dt translation
+         captureSpeciesChargeDensity(mpiGrid, cells, speciesRhoQ_k);
+      }
 #endif
 
-      // First part of the translation-acceleration-translation cycle: theta*dt
-      // of real space transport, bringing f to f*
+      // First part of the AP translation-acceleration-translation cycle takes
+      // only theta*dt of real-space transport (bringing f to f*); LDZ/ES take
+      // the full dt here in a single translation step.
       phiprof::Timer spatialSpaceTimer {"Spatial-space"};
       if( P::propagateVlasovTranslation) {
-         calculateSpatialTranslation(mpiGrid, P::FieldSolverTheta*P::dt);
+         Real firstTranslationDt = P::dt;
+#ifdef FS_AP
+         if (fieldSolverIsAP) {
+            firstTranslationDt = P::FieldSolverTheta * P::dt;
+         }
+#endif
+         calculateSpatialTranslation(mpiGrid, firstTranslationDt);
       } else {
          calculateSpatialTranslation(mpiGrid,0.0);
       }
@@ -1346,9 +1426,11 @@ int simulate(int argn,char* args[]) {
          addTimedBarrier("barrier-boundary-conditions");
       }
 
-      // Capture J_s^{k*} (per species) now that_R moments holds exactly f*'s moments.
 #ifdef FS_AP
-      captureSpeciesCurrentDensity(mpiGrid, cells, speciesJ_kstar);
+      if (fieldSolverIsAP) {
+         // Capture J_s^{k*} (per species) now that _R moments holds exactly f*'s moments.
+         captureSpeciesCurrentDensity(mpiGrid, cells, speciesJ_kstar);
+      }
 #endif
 
       phiprof::Timer momentsTimer {"Compute interp moments"};
@@ -1374,16 +1456,18 @@ int simulate(int argn,char* args[]) {
          phiprof::Timer propagateTimer {"Propagate Fields"};
 
          phiprof::Timer couplingInTimer {"fsgrid-coupling-in"};
-#ifdef FS_AP
          // Copy moments over into the fsgrid.
          feedMomentsIntoFsGrid(mpiGrid, cells, moments, technical.view(), fsgrid, false);
          feedMomentsIntoFsGrid(mpiGrid, cells, momentsdt2, technical.view(), fsgrid, true);
+#ifdef FS_AP
          // Copy the per-species rho_s^k / J_s^{k*} over into the fsgrid.
          std::vector<fsgrids::speciesrhoqspan> speciesRhoQView;
          std::vector<fsgrids::speciesjspan> speciesJView;
          for (auto& x : fsSpeciesRhoQ) { speciesRhoQView.push_back(x.view()); }
          for (auto& x : fsSpeciesJ)    { speciesJView.push_back(x.view()); }
-         feedSpeciesMomentsIntoFsGrid(mpiGrid, cells, speciesRhoQ_k, speciesJ_kstar, speciesRhoQView, speciesJView);
+         if (fieldSolverIsAP) {
+            feedSpeciesMomentsIntoFsGrid(mpiGrid, cells, speciesRhoQ_k, speciesJ_kstar, speciesRhoQView, speciesJView);
+         }
 #endif
          // Update the spans of the filtered grids that were swapped in filtering
          if (P::amrMaxSpatialRefLevel > 0) {
@@ -1495,22 +1579,27 @@ int simulate(int argn,char* args[]) {
          addTimedBarrier("barrier-boundary-conditions");
       }
 
-      // Last part of the translate-accelerate-translate cycle: (1-theta)*dt of
-      // real space advection
-      spatialSpaceTimer.start();
-      if( P::propagateVlasovTranslation) {
-         calculateSpatialTranslation(mpiGrid, (1.0-P::FieldSolverTheta)*P::dt);
-      } else {
-         calculateSpatialTranslation(mpiGrid,0.0);
-      }
-      spatialSpaceTimer.stop(computedCells, "Cells");
+#ifdef FS_AP
+      if (fieldSolverIsAP) {
+         // Last part of the translate-accelerate-translate cycle: (1-theta)*dt of
+         // real space advection. LDZ/ES took the full dt in one translation step
+         // earlier in this iteration and have nothing further to do here.
+         spatialSpaceTimer.start();
+         if( P::propagateVlasovTranslation) {
+            calculateSpatialTranslation(mpiGrid, (1.0-P::FieldSolverTheta)*P::dt);
+         } else {
+            calculateSpatialTranslation(mpiGrid,0.0);
+         }
+         spatialSpaceTimer.stop(computedCells, "Cells");
 
-      if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
-         phiprof::Timer timer {"Update system boundaries (Vlasov post-translation)"};
-         sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, P::t + 0.5 * P::dt, false);
-         timer.stop();
-         addTimedBarrier("barrier-boundary-conditions");
+         if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration ) {
+            phiprof::Timer timer {"Update system boundaries (Vlasov post-translation)"};
+            sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, P::t + 0.5 * P::dt, false);
+            timer.stop();
+            addTimedBarrier("barrier-boundary-conditions");
+         }
       }
+#endif
 
       momentsTimer.start();
       // *here we compute rho and rho_v for timestep t + dt, so next

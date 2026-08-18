@@ -141,6 +141,7 @@ static std::vector<CurlTerm> curlCurlStencil(int outComp, const std::array<Real,
 bool ap_SolveElectricField(
    fsgrids::efieldspan e,
    fsgrids::efieldspan edt2,
+   fsgrids::constperbspan perb,
    fsgrids::constbgbspan bgb,
    fsgrids::constdperbspan dperb,
    const std::vector<std::array<Real,9>>& mu,
@@ -247,13 +248,17 @@ bool ap_SolveElectricField(
             const Real Ek = e[lid][comp]; // e holds E^k on entry, E^{k+theta} on exit -- read before overwrite
 
             // curl(B^k)
-            const Real ydx = (bgb[lid][fsgrids::bgbfield::dBGBydx] + dperb[lid][fsgrids::dperb::dPERBydx]) / dxyz[0];
-            const Real zdx = (bgb[lid][fsgrids::bgbfield::dBGBzdx] + dperb[lid][fsgrids::dperb::dPERBzdx]) / dxyz[0];
-            const Real xdy = (bgb[lid][fsgrids::bgbfield::dBGBxdy] + dperb[lid][fsgrids::dperb::dPERBxdy]) / dxyz[1];
-            const Real zdy = (bgb[lid][fsgrids::bgbfield::dBGBzdy] + dperb[lid][fsgrids::dperb::dPERBzdy]) / dxyz[1];
-            const Real xdz = (bgb[lid][fsgrids::bgbfield::dBGBxdz] + dperb[lid][fsgrids::dperb::dPERBxdz]) / dxyz[2];
-            const Real ydz = (bgb[lid][fsgrids::bgbfield::dBGBydz] + dperb[lid][fsgrids::dperb::dPERBydz]) / dxyz[2];
-            const std::array<Real,3> curlBtotalVec = { zdy-ydz, xdz-zdx, ydx-xdy }; // (curl B)_x,y,z
+            // NOT via dperb, which uses a nonlinear TVD slope limiter
+            std::array<Real,3> curlBtotalVec = {0.0, 0.0, 0.0};
+            for (int outComp = 0; outComp < 3; ++outComp) {
+               Real acc = 0.0;
+               for (const auto& term : curlStencilCentered(outComp, dxyz)) {
+                  if (!stencil.cellExists(term.di, term.dj, term.dk)) { continue; }
+                  const size_t nlid = stencil.indexFromOffset(term.di, term.dj, term.dk);
+                  acc += term.coeff * (perb[nlid][term.comp] + bgb[nlid][term.comp]);
+               }
+               curlBtotalVec[outComp] = acc;
+            }
             const Real curlBtotal = curlBtotalVec[comp];
 
             const Real rhs = reactionScale*Ek + c*c*theta/dt*curlBtotal
@@ -583,7 +588,7 @@ void ap_GaussLawCorrection(
    }
 
    // Periodic-domain null space: subtract mean(bvals), same treatment
-   // es_ElectrostaticPotential uses for its own (mu=0) Poisson solve --
+   // es_ElectrostaticPotential uses for its own (mu=0) Poisson solve
    {
       double sumB_local = 0.0;
       for (long long c = 0; c < nlocal; ++c) { sumB_local += bvals[c]; }
@@ -752,7 +757,7 @@ void ap_GaussLawCorrection(
 static void ap_ReportFieldMagnitude(const char* label, fsgrids::constefieldspan field,
                                      fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
    int myRank; MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
-   double maxAbsLocal = 0.0;
+   double maxAbsLocal[3] = {0.0, 0.0, 0.0};
    bool nonFiniteLocal = false;
    fsgrid.serial_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
@@ -763,17 +768,72 @@ static void ap_ReportFieldMagnitude(const char* label, fsgrids::constefieldspan 
          for (int comp = 0; comp < 3; ++comp) {
             const Real v = field[lid][comp];
             if (!std::isfinite(v)) { nonFiniteLocal = true; }
-            if (std::abs(v) > maxAbsLocal) { maxAbsLocal = std::abs(v); }
+            if (std::abs(v) > maxAbsLocal[comp]) { maxAbsLocal[comp] = std::abs(v); }
          }
       });
-   double maxAbsGlobal = 0.0;
-   MPI_Allreduce(&maxAbsLocal, &maxAbsGlobal, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+   double maxAbsGlobal[3] = {0.0, 0.0, 0.0};
+   MPI_Allreduce(maxAbsLocal, maxAbsGlobal, 3, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
    int nonFiniteLocalInt = nonFiniteLocal ? 1 : 0, nonFiniteGlobal = 0;
    MPI_Allreduce(&nonFiniteLocalInt, &nonFiniteGlobal, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
    if (myRank == MASTER_RANK) {
-      fprintf(stderr, "%s: max|E|=%e%s\n", label, maxAbsGlobal,
+      fprintf(stderr, "%s: max|Ex|=%e max|Ey|=%e max|Ez|=%e%s\n", label,
+              maxAbsGlobal[0], maxAbsGlobal[1], maxAbsGlobal[2],
               nonFiniteGlobal ? "  *** NaN/Inf ***" : "");
    }
+}
+
+// Low-pass filter, 3-point binomial with alpha=1/2
+// Transfer function T(k) = cos^2(k*dx/2)
+// Two-pass: computes every filtered value into a local buffer reading
+// neighbors from the original, then copies the buffer back.
+template<typename SpanType>
+static void ap_ApplyLowPassFilter1D(SpanType field, int axis, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   const auto localSize = fsgrid.getLocalSize();
+   const int lx = localSize[0], ly = localSize[1], lz = localSize[2];
+   std::vector<std::array<Real,3>> filtered((size_t)lx*ly*lz);
+
+   std::array<int,3> plusOffset{0,0,0};  plusOffset[axis]  =  1;
+   std::array<int,3> minusOffset{0,0,0}; minusOffset[axis] = -1;
+
+   fsgrid.serial_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("AP: low-pass filter, compute"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
+         const bool minusExists = stencil.cellExists(minusOffset[0], minusOffset[1], minusOffset[2]);
+         const bool plusExists  = stencil.cellExists(plusOffset[0],  plusOffset[1],  plusOffset[2]);
+         const size_t minusLid = minusExists ? stencil.indexFromOffset(minusOffset[0], minusOffset[1], minusOffset[2]) : lid;
+         const size_t plusLid  = plusExists  ? stencil.indexFromOffset(plusOffset[0],  plusOffset[1],  plusOffset[2])  : lid;
+         for (int comp = 0; comp < 3; ++comp) {
+            Real val = 0.5 * field[lid][comp];
+            val += 0.25 * field[minusLid][comp];
+            val += 0.25 * field[plusLid][comp];
+            filtered[lidx][comp] = val;
+         }
+      });
+
+   fsgrid.serial_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("AP: low-pass filter, write back"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
+         for (int comp = 0; comp < 3; ++comp) {
+            field[lid][comp] = filtered[lidx][comp];
+         }
+      });
+   fsgrid.updateGhostCells(field);
+}
+
+// Separable filter in all three dimensions
+template<typename SpanType>
+static void ap_ApplyLowPassFilter3D(SpanType field, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   ap_ApplyLowPassFilter1D(field, 0, technical, fsgrid); // x
+   ap_ApplyLowPassFilter1D(field, 1, technical, fsgrid); // y
+   ap_ApplyLowPassFilter1D(field, 2, technical, fsgrid); // z
 }
 
 bool ap_propagateFields(fsgrids::perbspan perb,
@@ -797,6 +857,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    }
 
    const Real theta = P::FieldSolverTheta;
+   const bool apEnableLowPassFilter = true;
    const Real c = physicalconstants::LIGHT_SPEED;
 
    // dt==0 special case: vlasiator.cpp calls this once before the main loop
@@ -808,12 +869,17 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    // rest of the code, but what ARE the timestep limits?
    bool converged = true;
    if (dt != 0.0) {
+
       std::vector<std::array<Real,9>> mu;
       std::vector<std::array<Real,3>> Jhat;
       ap_BuildSpeciesTensors(speciesRhoQ, speciesJ, vol, bgb, technical, fsgrid, theta, dt, mu, Jhat);
 
-      converged = ap_SolveElectricField(e, edt2, bgb, dperb, mu, Jhat, technical, fsgrid, c, theta, dt);
+      converged = ap_SolveElectricField(e, edt2, perb, bgb, dperb, mu, Jhat, technical, fsgrid, c, theta, dt);
       ap_ReportFieldMagnitude("ap_propagateFields: after raw solve (e)", e, technical, fsgrid);
+
+      if (apEnableLowPassFilter) {
+         ap_ApplyLowPassFilter3D(e, technical, fsgrid);
+      }
 
       ap_StageElectricFieldForAcceleration(edt2, vol, technical, fsgrid);
 
@@ -824,6 +890,10 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    }
 
    ap_UpdateMagneticField(perb, perbdt2, edt2 /* = E^{k+theta} */, technical, fsgrid, theta, dt);
+
+   if (apEnableLowPassFilter) {
+      ap_ApplyLowPassFilter3D(perb, technical, fsgrid);
+   }
 
    return converged;
 }

@@ -57,7 +57,6 @@ enum FieldsToCommunicate {
 std::vector<CellID> mapDccrgIdToFsGridGlobalID(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
 					       CellID dccrgID);
 
-#ifdef FS_AP
 /*! Take input moments from DCCRG grid and put them into the Fieldsolver grid
  * \param mpiGrid The DCCRG grid carrying rho, rhoV and P
  * \param cells List of local cells
@@ -74,6 +73,7 @@ void feedMomentsIntoFsGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>&
                            fsgrid::FsData<std::array<Real, fsgrids::moments::N_MOMENTS>>& moments,
                            fsgrids::technicalspan technical, FieldSolverGrid &fsgrid, bool dt2 = false);
 
+#ifdef FS_AP
 /*! Take per-species rho_s^k / J_s^{k*} from DCCRG-side flat
  * arrays and put them into per-population Fieldsolver-grid arrays.
  * \param mpiGrid       The DCCRG grid for its coupling maps
