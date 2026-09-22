@@ -23,7 +23,7 @@
 #include <cstdlib>
 
 #include "fs_common.h"
-#include "ldz_volume.hpp"
+#include "volume_averages.hpp"
 
 #ifdef DEBUG_VLASIATOR
    #define DEBUG_FSOLVER

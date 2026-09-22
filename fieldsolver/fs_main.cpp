@@ -54,7 +54,7 @@ bool propagateFields(fsgrids::perbspan perb,
       # endif
    } else if (P::fieldSolverMethod == "AP") {
       # ifdef FS_AP
-         return ap_propagateFields(perb, perbdt2, e, edt2, moments, speciesRhoQ, speciesJ, dperb, bgb, vol, technical, fsgrid, dt, subcycles);
+         return ap_propagateFields(perb, perbdt2, e, edt2, moments, speciesRhoQ, speciesJ, dperb, dmoments, bgb, vol, technical, fsgrid, dt, subcycles);
       # else
          fprintf(stderr, "Implicit electromagnetic field solver selected by P::fieldSolverMethod but FS_AP was not defined at compile time\n");
          abort();

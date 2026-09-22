@@ -139,6 +139,10 @@ namespace projects {
                       fsgrids::perbspan perb,
                       fsgrids::technicalspan technical, FieldSolverGrid &fsgrid) const {}
 
+   void Project::setProjectEField(fsgrids::momentsspan moments,
+                      fsgrids::efieldspan e,
+                      fsgrids::technicalspan technical, FieldSolverGrid &fsgrid) const {}
+
    void Project::setupBeforeSetCell(const std::vector<CellID>& cells) {
       // Dummy implementation.
       return;

@@ -106,6 +106,25 @@ namespace projects {
                                     fsgrids::bgbspan bgb,
                                     fsgrids::technicalspan technical, FieldSolverGrid &fsgrid);
 
+      /*! Initialize a longitudinal (curl-free) E field consistent with the
+       * project's initial charge density, via a Poisson solve: -eps0*grad^2(Phi)
+       * = rho(x,0), E = -grad(Phi). Default is a no-op; most projects start
+       * from E=0, which is fine when rho(x,0)=0 (quasi-neutral initial
+       * conditions). Projects whose initial density is NOT quasi-neutral
+       * (e.g. a density perturbation on only one species) need this to
+       * satisfy Gauss's law at t=0, which several field-solver schemes'
+       * consistency arguments depend on -- see Liu et al. 2025 Sec. 2.1 for
+       * the AP/RME scheme specifically. General over x/y/z: no assumption
+       * that rho varies in only one dimension.
+       * \param moments fsgrid moments, already populated with the initial rho.
+       * \param e fsgrid electric field to initialize (overwritten, not added to).
+       * \param technical Technical fsgrid, needed by the Poisson solve/gradient.
+       * \param fsgrid fsgrid container.
+       */
+      virtual void setProjectEField(fsgrids::momentsspan moments,
+                                    fsgrids::efieldspan e,
+                                    fsgrids::technicalspan technical, FieldSolverGrid &fsgrid) const;
+
       /*! Setup data structures for subsequent setCell calls.
        * This will most likely be empty for most projects, except for some advanced
        * data juggling ones (like restart from a subset of a larger run)

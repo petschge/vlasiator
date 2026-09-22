@@ -31,6 +31,7 @@
 #include "../../velocity_mesh_parameters.h"
 #include "../../backgroundfield/backgroundfield.h"
 #include "../../backgroundfield/constantfield.hpp"
+#include "../../fieldsolver/es_electric_field.hpp"
 
 #include "Dispersion.h"
 
@@ -256,5 +257,48 @@ namespace projects {
             cell[fsgrids::bfield::PERBZ] = magZPertAbsAmp_l * rndBuffer[2];
          });
       }
+   }
+
+   /*! Solve -eps0*grad^2(Phi) = rho(x,0), E = -grad(Phi), and write the
+    * result into e. Reuses the ES field solver's own Poisson solve
+    * (es_ElectrostaticPotential, a general 3D 7-point-stencil solve --
+    * no assumption that rho varies in only one dimension) and its
+    * per-component gradient functions (es_calculateElectricFieldX/Y/Z).
+    * Calls the plain per-component gradients directly rather than the
+    * SysBoundary-aware calculateElectrostaticField wrapper: Dispersion
+    * is a periodic-domain project, so there are no non-trivial boundary
+    * cells needing that delegation, and this avoids pulling in a
+    * SysBoundary dependency here for something that would never fire.
+    *
+    * moments must already hold rho(x,0) (fed from the initial f^0
+    * before this is called -- see vlasiator.cpp's pre-loop
+    * initialization sequence). Overwrites e rather than adding to it:
+    * only meaningful as a one-time initialization at t=0, not a
+    * per-step correction.
+    */
+   void Dispersion::setProjectEField(
+      fsgrids::momentsspan moments,
+      fsgrids::efieldspan e,
+      fsgrids::technicalspan technical, FieldSolverGrid &fsgrid
+   ) const {
+      if (P::isRestart) {
+         return; // restarts already have a properly-saved, self-consistent E
+      }
+
+      fsgrid::FsData<std::array<Real, fsgrids::potential::N_POTENTIAL>> Phi(fsgrid.getNumStorageCells());
+      es_ElectrostaticPotential(Phi.view(), moments, technical, fsgrid);
+
+      const auto dxyz = fsgrid.getGridSpacing();
+      const auto PhiView = Phi.view();
+      fsgrid.parallel_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("setProjectEField"), technical,
+         [=](const fsgrid::Coordinates &coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            es_calculateElectricFieldX(e, PhiView, stencil, dxyz);
+            es_calculateElectricFieldY(e, PhiView, stencil, dxyz);
+            es_calculateElectricFieldZ(e, PhiView, stencil, dxyz);
+         });
+      fsgrid.updateGhostCells(e);
    }
 } // namespace projects

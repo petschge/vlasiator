@@ -47,7 +47,7 @@
 #include "ldz_magnetic_field.hpp"
 #include "ldz_hall.hpp"
 #include "ldz_gradpe.hpp"
-#include "ldz_volume.hpp"
+#include "volume_averages.hpp"
 #include "fs_common.h"
 #include "derivatives.hpp"
 #include "fs_limiters.h"

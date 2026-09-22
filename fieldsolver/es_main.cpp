@@ -8,7 +8,7 @@
 #include "es_electric_field.hpp"
 #include "ldz_magnetic_field.hpp"
 #include "derivatives.hpp"
-#include "ldz_volume.hpp"
+#include "volume_averages.hpp"
 #include "../fieldtracing/fieldtracing.h"
 
 /*! \brief Top-level field propagation function.

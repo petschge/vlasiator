@@ -932,6 +932,16 @@ int simulate(int argn,char* args[]) {
          CellParams::P_12
       );
       computeMomentsTimer.stop();
+
+      if (fieldSolverIsAP) {
+         // The AP/RME scheme requires Gauss's law to hold at t=0.
+         // project->setProjectEField is a no-op for every project except ones
+         // that override it (currently just Dispersion).
+         phiprof::Timer initialEfieldTimer {"initialize-consistent-longitudinal-E"};
+         feedMomentsIntoFsGrid(mpiGrid, cells, moments, technical.view(), fsgrid, false);
+         project->setProjectEField(moments.view(), e.view(), technical.view(), fsgrid);
+         initialEfieldTimer.stop();
+      }
    }
 
    initTimer.stop();

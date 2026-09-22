@@ -53,6 +53,10 @@ namespace projects {
          fsgrids::perbspan perb, fsgrids::bgbspan bgb,
          fsgrids::technicalspan technical, FieldSolverGrid& fsgrid
       ) override;
+      virtual void setProjectEField(
+         fsgrids::momentsspan moments, fsgrids::efieldspan e,
+         fsgrids::technicalspan technical, FieldSolverGrid& fsgrid
+      ) const override;
       virtual void hook(
          cuint& stage,
          const dccrg::Dccrg<spatial_cell::SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid,

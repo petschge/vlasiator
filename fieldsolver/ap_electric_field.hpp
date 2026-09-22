@@ -1,7 +1,15 @@
 #pragma once
 /*
+ * This file is part of Vlasiator.
+ *
+ * AP (CSL-RME) field solver -- Liu, Cai, Cao, Lapenta (2025), J. Comput.
+ * Phys. 528, 113840. Implements Eqs. (23), (35)-(41), (45): the
+ * reformulated-Maxwell electric field solve (Eq. 38) replacing the old
+ * explicit RK2/Ohm's-law propagateFields, keeping Faraday's law (Eq. 23)
+ * and adding an optional Gauss's-law correction (Eq. 45).
+ *
  *  - Periodic boundaries only for now
- *  - ehall/egradpe/egradpedt2/dperb/dmoments/dmomentsdt2/bgb's non-volume
+ *  - ehall/egradpe/egradpedt2/dmoments/dmomentsdt2/bgb's non-volume
  *    components are accepted but NOT used.
  *  - Only bgb's *volume* components (BGBXVOL/BGBYVOL/BGBZVOL) are read, to combine
  *    with perb's volume components into a cell-centered total B for the tensor
@@ -9,6 +17,7 @@
  */
 
 #include "fs_common.h"
+#include "derivatives.hpp"
 #include <HYPRE.h>
 #include <HYPRE_IJ_mv.h>
 #include <HYPRE_parcsr_ls.h>
@@ -21,8 +30,8 @@
  *
  * \param speciesRhoQ  rho_s^k per population
  * \param speciesJ     J_s^{k*} per population
- * \param vol          volumetric perturbed B (PERBXVOL/YVOL/ZVOL).
- * \param bgb          background B; only BGBXVOL/YVOL/ZVOL are read.
+ * \param perb         perturbed B, face-centered/direct (PERBX/Y/Z).
+ * \param bgb          background B, face-centered/direct (BGBX/Y/Z).
  * \param theta        the AP splitting parameter
  * \param dt           current timestep.
  * \param outMu        output as 3x3 tensor per cell
@@ -31,7 +40,7 @@
 void ap_BuildSpeciesTensors(
    std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
    std::vector<fsgrids::speciesjspan>& speciesJ,
-   fsgrids::constvolspan vol,
+   fsgrids::constperbspan perb,
    fsgrids::constbgbspan bgb,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
@@ -42,7 +51,7 @@ void ap_BuildSpeciesTensors(
 );
 
 /*! Assemble and solve Eq. (38) for E^{k+theta} via HYPRE IJ + BoomerAMG,
- *  then compute E^{k+1} (Eq. 40) and write both into e/edt2.  */
+ *  then compute E^{k+1} (Eq. 40) and write both into e/edt2. */
 bool ap_SolveElectricField(
    fsgrids::efieldspan e,
    fsgrids::efieldspan edt2,
@@ -58,14 +67,6 @@ bool ap_SolveElectricField(
    Real dt
 );
 
-/*! Stage E^{k+theta} from edt2 into EXVOL/EYVOL/EZVOL.  */
-void ap_StageElectricFieldForAcceleration(
-   fsgrids::constefieldspan edt2,
-   fsgrids::volspan vol,
-   fsgrids::technicalspan technical,
-   FieldSolverGrid& fsgrid
-);
-
 /*! Faraday update: B^{k+1} = B^k - dt curl(E^{k+theta})  (Eq. 23), then
  *  B^{k+theta} = theta B^{k+1} + (1-theta) B^k  (Eq. 39).  */
 void ap_UpdateMagneticField(
@@ -78,9 +79,11 @@ void ap_UpdateMagneticField(
    Real dt
 );
 
-/*! Gauss's-law (Boris) correction (Eq. 45 then Eq. 41) */
+/*! Gauss's-law (Boris) correction (Eq. 45 then Eq. 41).  */
 void ap_GaussLawCorrection(
    fsgrids::efieldspan e,
+   fsgrids::efieldspan edt2,
+   fsgrids::constefieldspan eOld,
    fsgrids::momentsspan moments,
    const std::vector<std::array<Real,9>>& mu,
    fsgrids::technicalspan technical,
@@ -88,6 +91,7 @@ void ap_GaussLawCorrection(
    Real dt
 );
 
+/*! Top-level AP entry point, called from propagateFields */
 bool ap_propagateFields(fsgrids::perbspan perb,
                      fsgrids::perbspan perbdt2,
                      fsgrids::efieldspan e,
@@ -96,6 +100,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
                      std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
                      std::vector<fsgrids::speciesjspan>& speciesJ,
                      fsgrids::dperbspan dperb,
+                     fsgrids::dmomentsspan dmoments,
                      fsgrids::bgbspan bgb,
                      fsgrids::volspan vol,
                      fsgrids::technicalspan technical, FieldSolverGrid &fsgrid,
