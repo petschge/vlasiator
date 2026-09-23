@@ -33,6 +33,7 @@
 #include "Alfven/Alfven.h"
 #include "Diffusion/Diffusion.h"
 #include "Dispersion/Dispersion.h"
+#include "LandauDamping/LandauDamping.h"
 #include "Distributions/Distributions.h"
 #include "Firehose/Firehose.h"
 #include "Flowthrough/Flowthrough.h"
@@ -84,6 +85,7 @@ namespace projects {
       projects::Fluctuations::addParameters();
       projects::Harris::addParameters();
       projects::KHB::addParameters();
+      projects::LandauDamping::addParameters();
       projects::Larmor::addParameters();
       projects::Magnetosphere::addParameters();
       projects::MultiPeak::addParameters();
@@ -718,6 +720,9 @@ Project* createProject() {
    }
    if(Parameters::projectName == "LossCone") {
       rvalue = new projects::LossCone;
+   }
+   if(Parameters::projectName == "LandauDamping") {
+      rvalue = new projects::LandauDamping;
    }
 
 

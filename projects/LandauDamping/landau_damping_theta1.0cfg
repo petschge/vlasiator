@@ -1,0 +1,162 @@
+# Landau damping test, reproducing Liu, Cai, Cao & Lapenta 2025 (JCP
+# 528:113840), Section 5.1 / Eq. (51), using the new LandauDamping
+# project (projects/LandauDamping/) and Vlasiator's own AP field solver
+# with theta=1 and Gauss's-law correction enabled -- i.e. what the
+# paper calls "CSL-RME-WG"
+#
+# DELIBERATE DEVIATION FROM THE PAPER: velocity space here is genuine
+# 1D3V (vx, vy, AND vz all real, extended dimensions).
+#
+# Chosen reference scales
+#   Te = 1e5 K,  ne = 1e6 m^-3
+# ==> lambda_D = sqrt(eps0*kB*Te/(q^2*ne)) = 2.182256e+01 m
+#     v0 = sqrt(kB*Te/me)                  = 1.231111e+06 m/s
+#     omega_pe = sqrt(ne*q^2/(eps0*me))    = 5.641460e+04 rad/s
+#     t0 = 1/omega_pe                      = 1.772591e-05 s
+#
+# x0 = lambda_D (since lambda=lambda_D/x0=1)
+# k (dimensionless)=1 => k_phys = 1/x0 = 4.582415e-02 m^-1
+# Lx = 2*pi/k_phys = 2*pi*x0 = 1.371152e+02 m
+# Nx=64 => dx = Lx/64 = 2.142424e+00 m
+# vxm=vym=6*v0 = 7.386665e+06 m/s
+# dt = C*dx/vxm, C=1 = 2.900395e-07 s
+# t_max = 20*t0 = 3.545181e-04 s (~1222 steps)
+# system_write_t_interval = 0.1*t0 = 1.772591e-06 s
+#
+# ==================== Ion background ====================
+# The paper: "we assume ions are uniformly in the background, and only
+# consider the electrons dynamics" (Section 5.1)
+# Vlasiator has no native "static background charge" mechanism separate from an
+# actual, dynamical Vlasov population, so this is approximated the standard
+# way: a very heavy, cold, at-rest, UNPERTURBED ion population providing the
+# exact neutralizing background charge density.
+
+dynamic_timestep = 0
+project = LandauDamping
+ParticlePopulations = electron
+ParticlePopulations = ion
+
+propagate_field = 1
+propagate_vlasov_translation = 1
+propagate_vlasov_acceleration = 1
+
+[io]
+diagnostic_write_interval = 10
+write_initial_state = 1
+system_write_t_interval = 1.772591e-06
+system_write_file_name = bulk
+system_write_distribution_stride = 1
+system_write_distribution_xline_stride = 1
+system_write_distribution_yline_stride = 1
+system_write_distribution_zline_stride = 1
+
+[gridbuilder]
+x_length = 64
+y_length = 1
+z_length = 1
+x_min = 0.0
+x_max = 137.1151619345684
+y_min = 0.0
+y_max = 2.142424405227631
+z_min = 0.0
+z_max = 2.142424405227631
+
+dt = 2.9003947678316886e-07
+t_max = 3.545181421196417e-04
+
+[bailout]
+min_dt = 1e-12
+velocity_space_wall_block_margin = 1
+
+[boundaries]
+periodic_x = yes
+periodic_y = yes
+periodic_z = yes
+
+[variables]
+# Population moments (electron and ion)
+output = populations_vg_rho
+output = populations_vg_v
+output = populations_vg_ptensor
+output = populations_vg_blocks
+
+# Aggregate (species-summed) moments
+output = vg_rhom
+output = vg_rhoq
+
+# Fields: fg_e is what E_Ex = 0.5*integral(Ex^2)dx is built from
+output = fg_e
+output = fg_b
+output = vg_e_vol
+output = vg_b_vol
+
+output = vg_gridcoordinates
+output = vg_rank
+diagnostic = populations_vg_blocks
+
+[fieldsolver]
+method = AP
+theta = 1.0
+enforceGaussLaw = 1
+
+[LandauDamping]
+# Global wavenumber shared by whichever species has densityPertRelAmp!=0
+# (electrons only, here) -- k (dimensionless)=1 => k_phys=1/lambda_D.
+k = 0.045824146786756774
+
+[electron_properties]
+mass = 1
+mass_units = ELECTRON
+charge = -1
+
+[electron_vspace]
+# 1D3V: full, genuine 3D velocity space
+vx_min = -7386664.839522138
+vx_max = +7386664.839522138
+vy_min = -7386664.839522138
+vy_max = +7386664.839522138
+vz_min = -7386664.839522138
+vz_max = +7386664.839522138
+vx_length = 16
+vy_length = 16
+vz_length = 16
+
+[electron_sparse]
+# With 16 blocks over +-6*vth (block width 0.75*vth), minValue=1e-16 prunes at
+# vx=3.4*vth, leaving a verified 2.6*vth = 3.45 block margin
+minValue = 1.0e-16
+
+[electron_LandauDamping]
+VX0 = 0.0
+VY0 = 0.0
+VZ0 = 0.0
+rho = 1.0e6
+Temperature = 1.0e5
+densityPertRelAmp = 0.01
+
+[ion_properties]
+mass = 1.0e5
+mass_units = ELECTRON
+charge = 1
+
+[ion_vspace]
+vx_min = -23358.685205172103
+vx_max = +23358.685205172103
+vy_min = -23358.685205172103
+vy_max = +23358.685205172103
+vz_min = -23358.685205172103
+vz_max = +23358.685205172103
+vx_length = 10
+vy_length = 10
+vz_length = 10
+
+[ion_sparse]
+minValue = 1.0e-7
+
+[ion_LandauDamping]
+VX0 = 0.0
+VY0 = 0.0
+VZ0 = 0.0
+rho = 1.0e6
+Temperature = 1.0e5
+densityPertRelAmp = 0.0
