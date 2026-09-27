@@ -57,10 +57,7 @@ void updateAccelerationMaxdt(
 
 /*!
  Compute the affine (rotation + translation) transform representing the
- velocity-space Lorentz-force push over one subcycle substep, per Liu et al.
- 2025 Eq. (20):
-
-   v -> v - (q/m)(E^{k+theta} + v x B^{k+theta}) dt
+ velocity-space Lorentz-force push over one subcycle substep.
 
  the combined rotation+translation is built up from many small substeps (0.1
  deg of gyration each) rather than in one step, so that the E x B drift is
@@ -95,7 +92,35 @@ Eigen::Transform<Real,3,Eigen::Affine> compute_acceleration_transformation(
      = 2 * M_PI * getObjectWrapper().particleSpecies[popID].mass
      / (getObjectWrapper().particleSpecies[popID].charge * B_mag);
 
-   // E^{k+theta}, solved from Eq. (38)
+   // Only LDZ needs the Hall/bulk-velocity pivot reconstruction; ES and AP
+   // hand us the complete E
+   const bool fieldSolverNeedsHallReconstruction = (P::fieldSolverMethod == "LDZ" || P::fieldSolverMethod == "default_fieldsolver");
+
+   // curl of B (only perturbed, curl of background field is always 0!) and
+   // the Hall prefactor 1/(mu0*rho_q)
+   Real hallPrefactor = 0.0;
+   Real dBXdy = 0.0, dBXdz = 0.0, dBYdx = 0.0, dBYdz = 0.0, dBZdx = 0.0, dBZdy = 0.0;
+   Eigen::Matrix<Real,3,1> bulk_velocity(0.0, 0.0, 0.0);
+   if (fieldSolverNeedsHallReconstruction) {
+      // scale rho for hall term, if user requests
+      const Real EPSILON = 1e10 * numeric_limits<Real>::min();
+      const Real rhoq = spatial_cell->parameters[CellParams::RHOQ_V] + EPSILON;
+      const Real hallRhoq = (rhoq <= Parameters::hallMinimumRhoq) ? Parameters::hallMinimumRhoq : rhoq;
+      hallPrefactor = 1.0 / (physicalconstants::MU_0 * hallRhoq);
+
+      dBXdy = spatial_cell->derivativesBVOL[bvolderivatives::dPERBXVOLdy];
+      dBXdz = spatial_cell->derivativesBVOL[bvolderivatives::dPERBXVOLdz];
+      dBYdx = spatial_cell->derivativesBVOL[bvolderivatives::dPERBYVOLdx];
+      dBYdz = spatial_cell->derivativesBVOL[bvolderivatives::dPERBYVOLdz];
+      dBZdx = spatial_cell->derivativesBVOL[bvolderivatives::dPERBZVOLdx];
+      dBZdy = spatial_cell->derivativesBVOL[bvolderivatives::dPERBZVOLdy];
+
+      bulk_velocity = Eigen::Matrix<Real,3,1>(spatial_cell->parameters[CellParams::VX_V],
+                                              spatial_cell->parameters[CellParams::VY_V],
+                                              spatial_cell->parameters[CellParams::VZ_V]);
+   }
+
+   // The electric field from ES/AP or
    const Eigen::Matrix<Real,3,1> E(spatial_cell->parameters[CellParams::EXVOL],
                                    spatial_cell->parameters[CellParams::EYVOL],
                                    spatial_cell->parameters[CellParams::EZVOL]);
@@ -117,16 +142,36 @@ Eigen::Transform<Real,3,Eigen::Affine> compute_acceleration_transformation(
       spatial_cell->parameters[CellParams::EZGRADPE]);
 
    for (uint i=0; i<bulk_velocity_substeps; ++i) {
-      // v x B gyration: pure rotation around the B axis through the origin.
-      total_transform = AngleAxis<Real>(substeps_radians,unit_B)*total_transform;
+      if (fieldSolverNeedsHallReconstruction) {
+         // rotation origin is the point through which we place our rotation axis (direction of which is unitB).
+         // first add bulk velocity (using the total transform computed this far.
+         Eigen::Matrix<Real,3,1> rotation_pivot(total_transform*bulk_velocity);
+
+         //include lorentzHallTerm (we should include, always)
+         rotation_pivot[0]-= hallPrefactor*(dBZdy - dBYdz);
+         rotation_pivot[1]-= hallPrefactor*(dBXdz - dBZdx);
+         rotation_pivot[2]-= hallPrefactor*(dBYdx - dBXdy);
+
+         // add to transform matrix the small rotation around  pivot
+         // when added like this, and not using *= operator, the transformations
+         // are in the correct order
+         total_transform = Translation<Real,3>(-rotation_pivot)*total_transform;
+         total_transform = AngleAxis<Real>(substeps_radians,unit_B)*total_transform;
+         total_transform = Translation<Real,3>(rotation_pivot)*total_transform;
+      } else {
+         // v x B gyration: pure rotation around the B axis through the origin.
+         total_transform = AngleAxis<Real>(substeps_radians,unit_B)*total_transform;
+      }
 
       // Electron pressure gradient term, only for the old field solver
       if(Parameters::ohmGradPeTerm > 0) {
          total_transform=Translation<Real,3>( (fabs(getObjectWrapper().particleSpecies[popID].charge)/getObjectWrapper().particleSpecies[popID].mass) * EgradPe * substeps_dt) * total_transform;
       }
 
-      // Electric field acceleration, only or ES and AP field solver
-      total_transform=Translation<Real,3>( (getObjectWrapper().particleSpecies[popID].charge/getObjectWrapper().particleSpecies[popID].mass) * E * substeps_dt) * total_transform;
+      // Electric field acceleration, only for ES and AP field solver
+      if (!fieldSolverNeedsHallReconstruction) {
+         total_transform=Translation<Real,3>( (getObjectWrapper().particleSpecies[popID].charge/getObjectWrapper().particleSpecies[popID].mass) * E * substeps_dt) * total_transform;
+      }
    }
 
    return total_transform;
