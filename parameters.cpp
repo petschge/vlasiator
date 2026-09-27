@@ -128,6 +128,7 @@ Real P::maxWaveVelocity = 0.0;
 uint P::maxFieldSolverSubcycles = 0.0;
 Real P::FieldSolverTheta = 0.5;
 bool P::apEnforceGaussLaw = true;
+bool P::apLowPassFilter = false;
 int P::maxSlAccelerationSubcycles = 0.0;
 Real P::resistivity = NAN;
 bool P::fieldSolverDiffusiveEterms = true;
@@ -359,6 +360,7 @@ bool P::addParameters() {
    RP::add("fieldsolver.maxSubcycles", "Maximum allowed field solver subcycles", 1);
    RP::add("fieldsolver.theta", "Implicitness parameter of the AP field solver. 0.5 <= theta <= 1.", 0.5);
    RP::add("fieldsolver.enforceGaussLaw", "Should a scalar electrostatic potential be calculated to correct the divergence of the electric field", true);
+   RP::add("fieldsolver.lowPassFilter", "Should a 3-point binomial low-pass filter be applied to E and B after each AP fieldsolver solve?", false);
    RP::add("fieldsolver.resistivity", "Resistivity for the eta*J term in Ohm's law.", 0.0);
    RP::add("fieldsolver.diffusiveEterms", "Enable diffusive terms in the computation of E", true);
    RP::add("fieldsolver.finiteDifferencingAtBoundaries", "Enable finite differencing at sysboundaries", false);
@@ -1014,6 +1016,7 @@ void Parameters::getParameters() {
    RP::get("fieldsolver.maxSubcycles", P::maxFieldSolverSubcycles);
    RP::get("fieldsolver.theta", P::FieldSolverTheta);
    RP::get("fieldsolver.enforceGaussLaw", P::apEnforceGaussLaw);
+   RP::get("fieldsolver.lowPassFilter", P::apLowPassFilter);
    RP::get("fieldsolver.resistivity", P::resistivity);
    RP::get("fieldsolver.diffusiveEterms", P::fieldSolverDiffusiveEterms);
    RP::get("fieldsolver.finiteDifferencingAtBoundaries",P::fieldSolverFiniteDifferencingAtBoundaries);

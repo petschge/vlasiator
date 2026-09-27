@@ -138,6 +138,8 @@ struct Parameters {
    static uint maxFieldSolverSubcycles; /*!< Maximum allowed field solver subcycles. */
    static Real FieldSolverTheta;        /*!< Theta parameters in AP fieldsolver. */
    static bool apEnforceGaussLaw;       /*!< Should Gauss cleaning be performed after the AP fieldsolver. */
+   static bool apLowPassFilter;         /*!< Should a 3-point binomial low-pass filter be applied to
+                                           E and B after each AP fieldsolver solve? Off by default. */
    static Real resistivity;             /*!< Resistivity in Ohm's law eta*J term. */
    static uint ohmHallTerm; /*!< Enable/choose spatial order of Hall term in Ohm's law JXB term. 0: off, 1: 1st spatial
                                order, 2: 2nd spatial order. */

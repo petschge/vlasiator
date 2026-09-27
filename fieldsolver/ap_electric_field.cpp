@@ -872,7 +872,6 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    fsgrid.updateGhostCells(dperb);
 
    const Real theta = P::FieldSolverTheta;
-   const bool apEnableLowPassFilter = true;
    const Real c = physicalconstants::LIGHT_SPEED;
 
    // dt==0 special case: vlasiator.cpp calls this once before the main loop
@@ -906,7 +905,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
       converged = ap_SolveElectricField(e, edt2, perb, bgb, dperb, mu, Jhat, technical, fsgrid, c, theta, dt);
       ap_ReportFieldMagnitude("ap_propagateFields: after raw solve (e)", e, technical, fsgrid);
 
-      if (apEnableLowPassFilter) {
+      if (P::apLowPassFilter) {
          ap_ApplyLowPassFilter3D(e, technical, fsgrid);
          ap_ApplyLowPassFilter3D(edt2, technical, fsgrid); // same filter, now also applied to E^{k+theta}
       }
@@ -928,7 +927,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    ap_StageMagneticFieldForAcceleration(perbdt2, vol, technical, fsgrid);
    ap_StageElectricFieldForAcceleration(edt2, vol, technical, fsgrid);
 
-   if (apEnableLowPassFilter) {
+   if (P::apLowPassFilter) {
       ap_ApplyLowPassFilter3D(perb, technical, fsgrid);
    }
 
