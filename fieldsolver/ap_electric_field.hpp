@@ -79,7 +79,10 @@ void ap_UpdateMagneticField(
    Real dt
 );
 
-/*! Gauss's-law (Boris) correction (Eq. 45 then Eq. 41).  */
+/*! Gauss's-law (Boris) correction (Eq. 45 then Eq. 41). E^{k+1} gets the
+ *  full correction; E^{k+theta} = theta*E^{k+1}+(1-theta)*E^k gets theta
+ *  times it, to stay consistent with Eq. (40) since E^k is not itself
+ *  corrected here. */
 void ap_GaussLawCorrection(
    fsgrids::efieldspan e,
    fsgrids::efieldspan edt2,
@@ -88,6 +91,7 @@ void ap_GaussLawCorrection(
    const std::vector<std::array<Real,9>>& mu,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
+   Real theta,
    Real dt
 );
 

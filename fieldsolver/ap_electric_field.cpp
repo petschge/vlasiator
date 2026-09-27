@@ -432,6 +432,7 @@ void ap_GaussLawCorrection(
    const std::vector<std::array<Real,9>>& mu,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
+   Real theta,
    Real dt
 ) {
 
@@ -716,7 +717,11 @@ void ap_GaussLawCorrection(
       for (long long c = 0; c < nlocal; ++c) { phiLocal[c] -= meanPhi; }
    }
 
-   // Eq. 41: E~^{k+1} = E^{k+1} - grad(phi)
+   // Eq. 41: E~^{k+1} = E^{k+1} - grad(phi). E^{k+theta} is not directly
+   // corrected by Eq. 41 -- only E^{k+1} is -- so to stay consistent with
+   // Eq. 40 (E^{k+theta} = theta*E^{k+1} + (1-theta)*E^k, with E^k left as
+   // is here) the correction applied to edt2 must be theta*(-grad(phi)),
+   // not the full -grad(phi) applied to e.
    fsgrid::FsData<std::array<Real,1>> phiGrid(fsgrid.getNumStorageCells());
    fsgrid.serial_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
@@ -739,17 +744,17 @@ void ap_GaussLawCorrection(
             if (stencil.cellExists(1,0,0) && stencil.cellExists(-1,0,0)) {
                const Real dEx = -0.5*(phiGrid[stencil.indexFromOffset(1,0,0)][0]-phiGrid[stencil.indexFromOffset(-1,0,0)][0])/dxyz[0];
                e[lid][0] += dEx;
-               edt2[lid][0] += dEx; // same phi, same correction, applied to E^{k+theta} too
+               edt2[lid][0] += theta*dEx; // Eq. 40 consistency: E^{k+theta} only gets theta * the full E^{k+1} correction
             }
             if (stencil.cellExists(0,1,0) && stencil.cellExists(0,-1,0)) {
                const Real dEy = -0.5*(phiGrid[stencil.indexFromOffset(0,1,0)][0]-phiGrid[stencil.indexFromOffset(0,-1,0)][0])/dxyz[1];
                e[lid][1] += dEy;
-               edt2[lid][1] += dEy;
+               edt2[lid][1] += theta*dEy;
             }
             if (stencil.cellExists(0,0,1) && stencil.cellExists(0,0,-1)) {
                const Real dEz = -0.5*(phiGrid[stencil.indexFromOffset(0,0,1)][0]-phiGrid[stencil.indexFromOffset(0,0,-1)][0])/dxyz[2];
                e[lid][2] += dEz;
-               edt2[lid][2] += dEz;
+               edt2[lid][2] += theta*dEz;
             }
          });
       fsgrid.updateGhostCells(e);
@@ -911,7 +916,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
       }
 
       if (P::apEnforceGaussLaw) {
-         ap_GaussLawCorrection(e, edt2, eOldSnapshot.view(), moments, mu, technical, fsgrid, dt);
+         ap_GaussLawCorrection(e, edt2, eOldSnapshot.view(), moments, mu, technical, fsgrid, theta, dt);
       }
 
       ap_StageElectricFieldForAcceleration(edt2, vol, technical, fsgrid);
