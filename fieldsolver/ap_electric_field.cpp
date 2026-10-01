@@ -1,51 +1,264 @@
 #include "ap_electric_field.hpp"
-#include "volume_averages.hpp"
 #include <cmath>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <tuple>
 #include "../object_wrapper.h"
 
 using namespace std;
 
+// Everything below treats E and B as 3-vectors stored per cell.
+static_assert(fsgrids::bfield::N_BFIELD == 3 && fsgrids::efield::N_EFIELD == 3, "AP solver assumes 3-component E and B");
+static_assert(fsgrids::bfield::PERBX == 0 && fsgrids::bfield::PERBY == 1 && fsgrids::bfield::PERBZ == 2, "component order");
+static_assert(fsgrids::efield::EX == 0 && fsgrids::efield::EY == 1 && fsgrids::efield::EZ == 2, "component order");
+
+typedef std::array<Real,3> ApVec3;
+typedef fsgrid::FsData<ApVec3> ApNodeField; // node-centred (= Vlasov cell-centre) vector field, with ghost cells
+
+static const int kBgbVol[3] = {fsgrids::bgbfield::BGBXVOL, fsgrids::bgbfield::BGBYVOL, fsgrids::bgbfield::BGBZVOL};
+
 /* ============================================================
- * Section 1: alpha_s / mu / J-hat  (Eqs. 35-37)
+ * Section 0: pure index/stencil helpers (no grid access).
+ * Delimited so that they can be extracted verbatim by the standalone test.
+ * ============================================================ */
+
+// Yee <-> cell-centre incidence, as defined by volume_averages.cpp: cell i
+// spans [x_i, x_{i+1}] with its centre (= the collocated node) at x_{i+1/2}.
+//  * B_c(i,j,k) sits on the face between cell i-1 and i along axis c.
+//  * E_c(i,j,k) sits on the edge shared by the 4 cells at offsets {0,-1}
+//    along each of the two axes other than c (0 along c).
+
+// Cells adjacent to the B_c face at a given Yee index, as offsets from that index.
+static std::array<std::array<int,3>,2> faceCellOffsets(int c) {
+   std::array<int,3> a{0,0,0}, b{0,0,0}; b[c] = -1;
+   return {a, b};
+}
+// Cells adjacent to the E_c edge at a given Yee index.
+static std::array<std::array<int,3>,4> edgeCellOffsets(int c) {
+   const int p = (c+1)%3, q = (c+2)%3;
+   std::array<std::array<int,3>,4> offs{};
+   int n = 0;
+   for (int dp = 0; dp >= -1; --dp) {
+      for (int dq = 0; dq >= -1; --dq) {
+         std::array<int,3> o{0,0,0}; o[p] = dp; o[q] = dq; offs[n++] = o;
+      }
+   }
+   return offs;
+}
+// Yee B_c samples belonging to a cell (its two faces along c), as offsets from the cell index.
+static std::array<std::array<int,3>,2> cellFaceOffsets(int c) {
+   std::array<int,3> a{0,0,0}, b{0,0,0}; b[c] = 1;
+   return {a, b};
+}
+// Yee E_c samples belonging to a cell (its 4 edges parallel to c), as offsets from the cell index.
+static std::array<std::array<int,3>,4> cellEdgeOffsets(int c) {
+   const int p = (c+1)%3, q = (c+2)%3;
+   std::array<std::array<int,3>,4> offs{};
+   int n = 0;
+   for (int dp = 0; dp <= 1; ++dp) {
+      for (int dq = 0; dq <= 1; ++dq) {
+         std::array<int,3> o{0,0,0}; o[p] = dp; o[q] = dq; offs[n++] = o;
+      }
+   }
+   return offs;
+}
+
+// Centred discrete curl on the collocated grid.
+struct CurlTerm { int comp; int di, dj, dk; Real coeff; };
+
+static std::array<CurlTerm,4> curlStencilCentered(int outComp, const std::array<Real,3>& dxyz) {
+   const int p = (outComp+1)%3, q = (outComp+2)%3;
+   std::array<int,3> plusP{0,0,0};  plusP[p]  = 1;
+   std::array<int,3> minusP{0,0,0}; minusP[p] = -1;
+   std::array<int,3> plusQ{0,0,0};  plusQ[q]  = 1;
+   std::array<int,3> minusQ{0,0,0}; minusQ[q] = -1;
+   return { CurlTerm{ q, plusP[0],plusP[1],plusP[2],     0.5/dxyz[p] },
+            CurlTerm{ q, minusP[0],minusP[1],minusP[2], -0.5/dxyz[p] },
+            CurlTerm{ p, minusQ[0],minusQ[1],minusQ[2],  0.5/dxyz[q] },
+            CurlTerm{ p, plusQ[0],plusQ[1],plusQ[2],    -0.5/dxyz[q] } };
+}
+
+// Composed curl-curl stencil for output E-component `outComp`: the centred
+// curl composed with itself. Using the identical operator for Faraday and
+// Ampere is what makes the scheme satisfy the discrete Poynting theorem.
+static std::vector<CurlTerm> curlCurlStencil(int outComp, const std::array<Real,3>& dxyz) {
+   std::map<std::tuple<int,int,int,int>, Real> acc;
+   for (const auto& outer : curlStencilCentered(outComp, dxyz)) {
+      for (const auto& inner : curlStencilCentered(outer.comp, dxyz)) {
+         acc[{inner.comp, outer.di+inner.di, outer.dj+inner.dj, outer.dk+inner.dk}]
+            += outer.coeff * inner.coeff;
+      }
+   }
+   std::vector<CurlTerm> result;
+   result.reserve(acc.size());
+   for (const auto& kv : acc) {
+      const auto& [comp,di,dj,dk] = kv.first;
+      if (kv.second != 0.0) { result.push_back({comp,di,dj,dk,kv.second}); }
+   }
+   return result;
+}
+
+// One row of the Eq. (38) matrix for E-component `comp` at a node:
+//   (1/dt^2) E + theta^2/eps0 mu.E + c^2 theta^2 curl curl E.
+// All quantities are collocated, so the reaction term is purely local.
+struct MatEntry { int comp; int di, dj, dk; Real val; };
+
+static std::vector<MatEntry> ap_EquationRow(int comp, const std::array<Real,9>& mu,
+                                            const std::array<Real,3>& dxyz,
+                                            Real reactionScale, Real muScale, Real curlScale) {
+   std::vector<MatEntry> row;
+   for (int cc = 0; cc < 3; ++cc) {
+      const Real val = (cc == comp ? reactionScale : 0.0) + muScale*mu[comp*3+cc];
+      if (val != 0.0) { row.push_back({cc, 0,0,0, val}); }
+   }
+   for (const auto& t : curlCurlStencil(comp, dxyz)) {
+      row.push_back({t.comp, t.di, t.dj, t.dk, curlScale*t.coeff});
+   }
+   return row;
+}
+
+/* ============================================================
+ * Section 1: persistent node-centred state and Yee <-> node interpolation
+ * ============================================================ */
+
+namespace {
+struct ApNodeState {
+   ApNodeField B; // perturbed B^k at nodes (background field is added where needed)
+   ApNodeField E; // E^k at nodes
+   explicit ApNodeState(size_t n) : B(n), E(n) {}
+};
+std::unique_ptr<ApNodeState> apNodeState;
+} // namespace
+
+// Yee -> node: the inverse pairing of the node -> Yee map below. E is exactly
+// the 4-edge mean that calculateVolumeAveragedFields uses for EXVOL/EYVOL/EZVOL;
+// B is the mean of the two faces of the cell (the legacy PERB?VOL without its
+// slope-limited curvature correction, so that no nonlinear limiter enters).
+static void ap_YeeToNodes(fsgrids::perbspan perb, fsgrids::efieldspan e,
+                          std::span<ApVec3> Bn, std::span<ApVec3> En,
+                          fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   fsgrid.updateGhostCells(perb);
+   fsgrid.updateGhostCells(e);
+   fsgrid.parallel_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("AP: Yee -> node"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         for (int c = 0; c < 3; ++c) {
+            Real acc = 0.0; int n = 0;
+            for (const auto& o : cellFaceOffsets(c)) {
+               if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
+               acc += perb[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+            }
+            Bn[lid][c] = n > 0 ? acc/n : perb[lid][c];
+            acc = 0.0; n = 0;
+            for (const auto& o : cellEdgeOffsets(c)) {
+               if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
+               acc += e[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+            }
+            En[lid][c] = n > 0 ? acc/n : e[lid][c];
+         }
+      });
+   fsgrid.updateGhostCells(Bn);
+   fsgrid.updateGhostCells(En);
+}
+
+// Node -> Yee, for output. B_c: mean of the two cells sharing the face.
+// E_c: mean of the 4 cells sharing the edge. (Transpose of the map above.)
+static void ap_NodesToYee(std::span<const ApVec3> Bn, std::span<const ApVec3> En,
+                          fsgrids::perbspan perbOut, fsgrids::efieldspan eOut,
+                          fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   fsgrid.parallel_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("AP: node -> Yee"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         for (int c = 0; c < 3; ++c) {
+            Real acc = 0.0; int n = 0;
+            for (const auto& o : faceCellOffsets(c)) {
+               if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
+               acc += Bn[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+            }
+            perbOut[lid][c] = n > 0 ? acc/n : Bn[lid][c];
+            acc = 0.0; n = 0;
+            for (const auto& o : edgeCellOffsets(c)) {
+               if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
+               acc += En[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+            }
+            eOut[lid][c] = n > 0 ? acc/n : En[lid][c];
+         }
+      });
+   fsgrid.updateGhostCells(perbOut);
+   fsgrid.updateGhostCells(eOut);
+}
+
+// The persistent state is created (and filled from the Yee arrays) on first use
+// and whenever the dt==0 setup call is made, which covers fresh starts (project
+// initial conditions) and restarts (first real step).
+static ApNodeState& ap_GetNodeState(fsgrids::perbspan perb, fsgrids::efieldspan e,
+                                    fsgrids::technicalspan technical, FieldSolverGrid& fsgrid,
+                                    bool forceRebuild) {
+   if (forceRebuild || !apNodeState || apNodeState->B.size() != (size_t)fsgrid.getNumStorageCells()) {
+      apNodeState = std::make_unique<ApNodeState>(fsgrid.getNumStorageCells());
+      ap_YeeToNodes(perb, e, apNodeState->B.view(), apNodeState->E.view(), technical, fsgrid);
+   }
+   return *apNodeState;
+}
+
+// Write the fields the Vlasov push will use straight into the volume-averaged
+// slots of vol. No interpolation: the node values are the cell-centre values.
+static void ap_PublishToVol(std::span<const ApVec3> B, std::span<const ApVec3> E, fsgrids::volspan vol,
+                            fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   fsgrid.parallel_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("AP: publish fields to vol"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         vol[lid][fsgrids::volfields::PERBXVOL] = B[lid][0];
+         vol[lid][fsgrids::volfields::PERBYVOL] = B[lid][1];
+         vol[lid][fsgrids::volfields::PERBZVOL] = B[lid][2];
+         vol[lid][fsgrids::volfields::EXVOL]    = E[lid][0];
+         vol[lid][fsgrids::volfields::EYVOL]    = E[lid][1];
+         vol[lid][fsgrids::volfields::EZVOL]    = E[lid][2];
+      });
+   fsgrid.updateGhostCells(vol);
+}
+
+/* ============================================================
+ * Section 2: alpha_s / mu / J-hat  (Eqs. 35-37), evaluated at the nodes
  * ============================================================ */
 
 void ap_BuildSpeciesTensors(
    std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
    std::vector<fsgrids::speciesjspan>& speciesJ,
-   fsgrids::constperbspan perb,
+   std::span<const ApVec3> Bnode,
    fsgrids::constbgbspan bgb,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
    Real theta,
    Real dt,
-   std::vector<std::array<Real,9>>& outMu,
-   std::vector<std::array<Real,3>>& outJhat
+   fsgrid::FsData<std::array<Real,9>>& outMu,
+   ApNodeField& outJhat
 ) {
-   const auto& localSize = fsgrid.getLocalSize();
-   const int lx = localSize[0], ly = localSize[1], lz = localSize[2];
-   const long long nLocalCells = (long long)lx*ly*lz;
-   outMu.assign(nLocalCells, std::array<Real,9>{0,0,0,0,0,0,0,0,0});
-   outJhat.assign(nLocalCells, std::array<Real,3>{0,0,0});
-
    const uint numPops = speciesRhoQ.size();
 
    fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
       phiprof::initializeTimer("AP: build alpha_s, mu, J-hat"),
       technical,
-      [&, lx, ly](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
 
          const size_t lid = stencil.ooo();
-         const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
 
-         // Cell-centered total B = perb + bgb
-         const Real Bx = perb[lid][fsgrids::bfield::PERBX] + bgb[lid][fsgrids::bgbfield::BGBXVOL];
-         const Real By = perb[lid][fsgrids::bfield::PERBY] + bgb[lid][fsgrids::bgbfield::BGBYVOL];
-         const Real Bz = perb[lid][fsgrids::bfield::PERBZ] + bgb[lid][fsgrids::bgbfield::BGBZVOL];
+         // Total B at the node = perturbed (node-centred state) + background (volume average)
+         const Real Bx = Bnode[lid][0] + bgb[lid][kBgbVol[0]];
+         const Real By = Bnode[lid][1] + bgb[lid][kBgbVol[1]];
+         const Real Bz = Bnode[lid][2] + bgb[lid][kBgbVol[2]];
 
          std::array<Real,9> mu{0,0,0,0,0,0,0,0,0};
          std::array<Real,3> jhat{0,0,0};
@@ -65,10 +278,6 @@ void ap_BuildSpeciesTensors(
             const Real denom = 1.0 + eps*eps*B2;
 
             // alpha_s = [I - eps * (I x B) + eps^2 * B B^T] / denom
-            // (I x B) as a matrix is just
-            //   [ 0   -Bz   By ]
-            //   [ Bz   0   -Bx ]
-            //   [-By   Bx   0  ]
             std::array<Real,9> alpha;
             alpha[0] = ( 1.0       + eps*eps*Bx*Bx) / denom;  // xx
             alpha[1] = (-eps*(-Bz) + eps*eps*Bx*By) / denom;  // xy
@@ -90,63 +299,26 @@ void ap_BuildSpeciesTensors(
             jhat[2] += alpha[6]*Jx + alpha[7]*Jy + alpha[8]*Jz;
          }
 
-         outMu[lidx]   = mu;
-         outJhat[lidx] = jhat;
+         outMu[lid]   = mu;
+         outJhat[lid] = jhat;
       });
+   // mu is read at neighbouring nodes by the Gauss-correction operator
+   fsgrid.updateGhostCells(outMu.view());
+   fsgrid.updateGhostCells(outJhat.view());
 }
 
 /* ============================================================
- * Section 2: discrete curl, composed for curl-curl matrix entries
- * ============================================================
- */
-
-struct CurlTerm { int comp; int di, dj, dk; Real coeff; };
-
-static std::array<CurlTerm,4> curlStencilCentered(int outComp, const std::array<Real,3>& dxyz) {
-   const int p = (outComp+1)%3, q = (outComp+2)%3;
-   std::array<int,3> plusP{0,0,0};  plusP[p]  = 1;
-   std::array<int,3> minusP{0,0,0}; minusP[p] = -1;
-   std::array<int,3> plusQ{0,0,0};  plusQ[q]  = 1;
-   std::array<int,3> minusQ{0,0,0}; minusQ[q] = -1;
-   return { CurlTerm{ q, plusP[0],plusP[1],plusP[2],     0.5/dxyz[p] },
-            CurlTerm{ q, minusP[0],minusP[1],minusP[2], -0.5/dxyz[p] },
-            CurlTerm{ p, minusQ[0],minusQ[1],minusQ[2],  0.5/dxyz[q] },
-            CurlTerm{ p, plusQ[0],plusQ[1],plusQ[2],    -0.5/dxyz[q] } };
-}
-
-// Composed curl-curl stencil for output E-component `outComp`: a list of
-// (inputComp, di,dj,dk, coefficient) accumulated by composing the
-// centered curl stencil with itself
-static std::vector<CurlTerm> curlCurlStencil(int outComp, const std::array<Real,3>& dxyz) {
-   std::map<std::tuple<int,int,int,int>, Real> acc;
-   for (const auto& outer : curlStencilCentered(outComp, dxyz)) {
-      for (const auto& inner : curlStencilCentered(outer.comp, dxyz)) {
-         acc[{inner.comp, outer.di+inner.di, outer.dj+inner.dj, outer.dk+inner.dk}]
-            += outer.coeff * inner.coeff;
-      }
-   }
-   std::vector<CurlTerm> result;
-   result.reserve(acc.size());
-   for (const auto& kv : acc) {
-      const auto& [comp,di,dj,dk] = kv.first;
-      if (kv.second != 0.0) { result.push_back({comp,di,dj,dk,kv.second}); }
-   }
-   return result;
-}
-
-/* ============================================================
- * Section 3: Eq. (38) -- HYPRE IJ assembly + BoomerAMG solve
- * ============================================================
- */
+ * Section 3: Eq. (38) -- HYPRE IJ assembly + BoomerAMG-preconditioned GMRES
+ * ============================================================ */
 
 bool ap_SolveElectricField(
-   fsgrids::efieldspan e,
-   fsgrids::efieldspan edt2,
-   fsgrids::constperbspan perb,
+   std::span<const ApVec3> Ek,
+   std::span<const ApVec3> Bk,
    fsgrids::constbgbspan bgb,
-   fsgrids::constdperbspan dperb,
-   const std::vector<std::array<Real,9>>& mu,
-   const std::vector<std::array<Real,3>>& Jhat,
+   std::span<const std::array<Real,9>> mu,
+   std::span<const ApVec3> Jhat,
+   std::span<ApVec3> Etheta,   // out: E^{k+theta}
+   std::span<ApVec3> Ekp1,     // out: E^{k+1}  (Eq. 40)
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
    Real c,
@@ -168,13 +340,11 @@ bool ap_SolveElectricField(
       dofOffset = 0;
    }
 
-   // Local k-major linear index
    auto localLinear = [lx,ly](int i, int j, int k) -> long long {
       return i + lx*((long long)j + ly*k);
    };
 
-   // DOF base (3x this cell's cell-index-within-numbering) per cell,
-   // stored so it can be ghost-exchanged like any other fsgrid quantity.
+   // DOF base per cell, stored so it can be ghost-exchanged like any other fsgrid quantity.
    fsgrid::FsData<std::array<Real,1>> dofBase(fsgrid.getNumStorageCells());
    fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
@@ -186,7 +356,7 @@ bool ap_SolveElectricField(
       });
    fsgrid.updateGhostCells(dofBase.view());
 
-   auto globalDof = [&](const fsgrid::FsStencil& stencil, size_t neighborLid, int comp) -> HYPRE_BigInt {
+   auto globalDof = [&](size_t neighborLid, int comp) -> HYPRE_BigInt {
       return (HYPRE_BigInt)llround(dofBase[neighborLid][0]) + comp;
    };
 
@@ -218,25 +388,15 @@ bool ap_SolveElectricField(
 
          if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE) { return; }
          const size_t lid = stencil.ooo();
-         const long long lidx = localLinear(stencil.i, stencil.j, stencil.k);
-         const auto& m = mu[lidx];
 
          for (int comp = 0; comp < 3; ++comp) {
-            const HYPRE_BigInt row = globalDof(stencil, lid, comp);
+            const HYPRE_BigInt row = globalDof(lid, comp);
 
-            // Reaction term: (1/dt^2) I + theta^2 mu/EPS_0, all at this cell.
             std::map<HYPRE_BigInt, Real> rowVals;
-            for (int cc = 0; cc < 3; ++cc) {
-               const Real diag = (cc==comp) ? reactionScale : 0.0;
-               const Real val = diag + muScale*m[comp*3+cc];
-               if (val != 0.0) { rowVals[globalDof(stencil, lid, cc)] += val; }
-            }
-
-            // curl-curl term, via the composed stencil (Section 2).
-            for (const auto& term : curlCurlStencil(comp, dxyz)) {
-               if (!stencil.cellExists(term.di, term.dj, term.dk)) { continue; } // Is this correct in a periodic box?
-               const size_t nlid = stencil.indexFromOffset(term.di, term.dj, term.dk);
-               rowVals[globalDof(stencil, nlid, term.comp)] += curlScale * term.coeff;
+            for (const auto& entry : ap_EquationRow(comp, mu[lid], dxyz, reactionScale, muScale, curlScale)) {
+               if (!stencil.cellExists(entry.di, entry.dj, entry.dk)) { continue; }
+               const size_t nlid = stencil.indexFromOffset(entry.di, entry.dj, entry.dk);
+               rowVals[globalDof(nlid, entry.comp)] += entry.val;
             }
 
             std::vector<HYPRE_BigInt> cols; cols.reserve(rowVals.size());
@@ -245,27 +405,21 @@ bool ap_SolveElectricField(
             HYPRE_Int ncols = (HYPRE_Int)cols.size();
             HYPRE_IJMatrixSetValues(Aij, 1, &ncols, &row, cols.data(), vals.data());
 
-            // RHS: (1/dt^2) E^k + (c^2 theta/dt) curl(B^k) - (theta/(dt*EPS_0)) J-hat
-            const Real Ek = e[lid][comp]; // e holds E^k on entry, E^{k+theta} on exit -- read before overwrite
-
-            // curl(B^k)
-            // NOT via dperb, which uses a nonlinear TVD slope limiter
-            std::array<Real,3> curlBtotalVec = {0.0, 0.0, 0.0};
-            for (int outComp = 0; outComp < 3; ++outComp) {
-               Real acc = 0.0;
-               for (const auto& term : curlStencilCentered(outComp, dxyz)) {
-                  if (!stencil.cellExists(term.di, term.dj, term.dk)) { continue; }
-                  const size_t nlid = stencil.indexFromOffset(term.di, term.dj, term.dk);
-                  acc += term.coeff * (perb[nlid][term.comp] + bgb[nlid][term.comp]);
-               }
-               curlBtotalVec[outComp] = acc;
+            // curl(B^k) with the same centred curl Faraday uses (NOT via dperb,
+            // which uses a nonlinear TVD slope limiter). Total B = perturbed + background.
+            Real curlB = 0.0;
+            for (const auto& term : curlStencilCentered(comp, dxyz)) {
+               if (!stencil.cellExists(term.di, term.dj, term.dk)) { continue; }
+               const size_t nlid = stencil.indexFromOffset(term.di, term.dj, term.dk);
+               curlB += term.coeff * (Bk[nlid][term.comp] + bgb[nlid][kBgbVol[term.comp]]);
             }
-            const Real curlBtotal = curlBtotalVec[comp];
 
-            const Real rhs = reactionScale*Ek + c*c*theta/dt*curlBtotal - theta/(dt*physicalconstants::EPS_0)*Jhat[lidx][comp];
+            // RHS of Eq. (38): (1/dt^2) E^k + (c^2 theta/dt) curl(B^k) - (theta/(dt*EPS_0)) J-hat
+            const Real Ekc = Ek[lid][comp];
+            const Real rhs = reactionScale*Ekc + c*c*theta/dt*curlB - theta/(dt*physicalconstants::EPS_0)*Jhat[lid][comp];
 
             HYPRE_IJVectorSetValues(bij, 1, &row, &rhs);
-            const Real x0 = Ek;
+            const Real x0 = Ekc;
             HYPRE_IJVectorSetValues(xij, 1, &row, &x0); // initial guess = E^k
          }
       });
@@ -278,8 +432,8 @@ bool ap_SolveElectricField(
    HYPRE_ParVector bpar; HYPRE_IJVectorGetObject(bij, (void**)&bpar);
    HYPRE_ParVector xpar; HYPRE_IJVectorGetObject(xij, (void**)&xpar);
 
-   // ---- Step 3: solve. BoomerAMG-preconditioned GMRES because  mu's I x B
-   // term might make the reaction block antisymmetric
+   // ---- Step 3: solve. BoomerAMG-preconditioned GMRES because mu's I x B
+   // term makes the reaction block non-symmetric
    HYPRE_Solver amg, gmres;
    HYPRE_BoomerAMGCreate(&amg);
    HYPRE_BoomerAMGSetPrintLevel(amg, 0);
@@ -311,13 +465,13 @@ bool ap_SolveElectricField(
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
          const size_t lid = stencil.ooo();
          for (int comp = 0; comp < 3; ++comp) {
-            const HYPRE_BigInt row = globalDof(stencil, lid, comp);
+            const HYPRE_BigInt row = globalDof(lid, comp);
             HYPRE_Real val;
             HYPRE_IJVectorGetValues(xij, 1, &row, &val);
             const Real Ektheta = (Real)val;
-            const Real Ek = e[lid][comp];
-            edt2[lid][comp] = Ektheta;                          // E^{k+theta}, staged in edt2
-            e[lid][comp]    = (Ektheta - Ek)/theta + Ek;        // E^{k+1}  (Eq. 40)
+            const Real Ekc = Ek[lid][comp];
+            Etheta[lid][comp] = Ektheta;
+            Ekp1[lid][comp]   = (Ektheta - Ekc)/theta + Ekc;   // Eq. 40
          }
       });
 
@@ -327,75 +481,27 @@ bool ap_SolveElectricField(
    HYPRE_IJVectorDestroy(bij);
    HYPRE_IJVectorDestroy(xij);
 
-   fsgrid.updateGhostCells(e);
-   fsgrid.updateGhostCells(edt2);
+   fsgrid.updateGhostCells(Etheta);
+   fsgrid.updateGhostCells(Ekp1);
    return (relres < 1e-6); // FIXME: what convergence threshold the rest of the solver treats as success
 }
 
 /* ============================================================
- * Section 3b: stage E for the Vlasov acceleration step (Eq. 20)
- * ============================================================
- * We have to get E into CellParams::EXVOL/EYVOL/EZVOL so that
- * getFieldsFromFsGrid gets it onto the Vlasov grid for us.
- */
-
-void ap_StageElectricFieldForAcceleration(
-   fsgrids::constefieldspan edt2,
-   fsgrids::volspan vol,
-   fsgrids::technicalspan technical,
-   FieldSolverGrid& fsgrid
-) {
-   fsgrid.parallel_for(
-      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
-      phiprof::initializeTimer("AP: stage E into vol"), technical,
-      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
-          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-         const size_t lid = stencil.ooo();
-         vol[lid][fsgrids::volfields::EXVOL] = edt2[lid][0];
-         vol[lid][fsgrids::volfields::EYVOL] = edt2[lid][1];
-         vol[lid][fsgrids::volfields::EZVOL] = edt2[lid][2];
-      });
-   fsgrid.updateGhostCells(vol);
-}
-
-/* ============================================================
- * Section 3c: stage B for the Vlasov acceleration step (Eq. 20, row 8)
- * ============================================================
- */
-void ap_StageMagneticFieldForAcceleration(
-   fsgrids::constperbspan perbdt2,
-   fsgrids::volspan vol,
-   fsgrids::technicalspan technical,
-   FieldSolverGrid& fsgrid
-) {
-   fsgrid.parallel_for(
-      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
-      phiprof::initializeTimer("AP: stage B^(k+theta) into vol"), technical,
-      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
-          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-         const size_t lid = stencil.ooo();
-         vol[lid][fsgrids::volfields::PERBXVOL] = perbdt2[lid][fsgrids::bfield::PERBX];
-         vol[lid][fsgrids::volfields::PERBYVOL] = perbdt2[lid][fsgrids::bfield::PERBY];
-         vol[lid][fsgrids::volfields::PERBZVOL] = perbdt2[lid][fsgrids::bfield::PERBZ];
-      });
-   fsgrid.updateGhostCells(vol);
-}
-
-/* ============================================================
- * Section 4: Faraday update (Eq. 23, 39)
+ * Section 4: Faraday update (Eq. 23, 39), on the nodes
  * ============================================================ */
 
 void ap_UpdateMagneticField(
-   fsgrids::perbspan perb,
-   fsgrids::perbspan perbdt2,
-   fsgrids::constefieldspan e, // holds E^{k+theta} here, per apSolveElectricField's edt2 output
+   std::span<const ApVec3> Bk,
+   std::span<const ApVec3> Etheta,
+   std::span<ApVec3> Bkp1,
+   std::span<ApVec3> Btheta,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
    Real theta,
    Real dt
 ) {
    const auto dxyz = fsgrid.getGridSpacing();
-   fsgrid.serial_for(
+   fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
       phiprof::initializeTimer("AP: Faraday update"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
@@ -405,34 +511,32 @@ void ap_UpdateMagneticField(
             Real curlE = 0.0;
             for (const auto& term : curlStencilCentered(comp, dxyz)) {
                if (!stencil.cellExists(term.di, term.dj, term.dk)) { continue; }
-               const size_t nlid = stencil.indexFromOffset(term.di, term.dj, term.dk);
-               curlE += term.coeff * e[nlid][term.comp];
+               curlE += term.coeff * Etheta[stencil.indexFromOffset(term.di, term.dj, term.dk)][term.comp];
             }
-
-            const Real Bk = perb[lid][comp];
-            const Real Bk1 = Bk - dt*curlE;                  // Eq. 23
-            perbdt2[lid][comp] = theta*Bk1 + (1.0-theta)*Bk; // Eq. 39, B^{k+theta}, staged in perbdt2
-            perb[lid][comp] = Bk1;                           // B^{k+1}
+            const Real Bkc = Bk[lid][comp];
+            const Real Bk1 = Bkc - dt*curlE;                    // Eq. 23
+            Bkp1[lid][comp]   = Bk1;                            // B^{k+1}
+            Btheta[lid][comp] = theta*Bk1 + (1.0-theta)*Bkc;    // Eq. 39
          }
       });
-   fsgrid.updateGhostCells(perb);
-   fsgrid.updateGhostCells(perbdt2);
+   fsgrid.updateGhostCells(Bkp1);
+   fsgrid.updateGhostCells(Btheta);
 }
 
 /* ============================================================
- * Section 5: Gauss's-law correction (Eq. 45, 41)
+ * Section 5: Gauss's-law correction (Eq. 45, 41), on the nodes
  * ============================================================
+ * As in Algorithm 3.4 step (2d), only E^{k+1} is corrected (it becomes the
+ * next step's E^k); E^{k+theta}, which the Vlasov push already uses, is not.
  */
 
 void ap_GaussLawCorrection(
-   fsgrids::efieldspan e,
-   fsgrids::efieldspan edt2,
-   fsgrids::constefieldspan eOld,
-   fsgrids::momentsspan moments,
-   const std::vector<std::array<Real,9>>& mu,
+   std::span<ApVec3> Ekp1,
+   std::span<const ApVec3> Ek,
+   std::span<const std::array<Real,1>> rho,   // rho^k at the nodes
+   std::span<const std::array<Real,9>> mu,    // mu^k at the nodes (ghost-exchanged)
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
-   Real theta,
    Real dt
 ) {
 
@@ -491,8 +595,7 @@ void ap_GaussLawCorrection(
          phiprof::initializeTimer("AP: compute mean(rho)"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-            const size_t lid = stencil.ooo();
-            sumRho_local += moments[lid][fsgrids::moments::RHOQ] / physicalconstants::EPS_0;
+            sumRho_local += rho[stencil.ooo()][0] / physicalconstants::EPS_0;
          });
       double sumRho_global = 0.0;
       MPI_Allreduce(&sumRho_local, &sumRho_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -507,47 +610,33 @@ void ap_GaussLawCorrection(
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
          const size_t lid = stencil.ooo();
          const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
-         const auto& m = mu[lidx];
+         const auto& m = mu[lid];
          double* mv = &mvals[nStencil*lidx];
 
-         // Isotropic part: -div[(I + (dt^2/EPS_0) diag(mu)) grad phi],
-         // FACE-AVERAGED, not per-cell.  -- the +x entry computed here and the
-         // -x entry the +x neighbor computes for the same shared face would
-         // generally disagree. Averaging (this cell, neighbor)/2 at each face
-         // fixes that: both cells compute the identical value for their shared
-         // connection. Confirmed this reduces exactly to the old per-cell
-         // formula when mu is spatially uniform (cxx_faceM=cxx_faceP=cxx_here
-         // in that case).
-         //
-         // KNOWN LIMITATION: mu is local-only (no ghost cells), so at an
-         // actual MPI rank boundary the true neighbor value isn't
-         // available here and this falls back to this cell's own value --
-         // NOT symmetric across rank boundaries specifically. A full fix
-         // needs mu exchanged with fsgrid's updateGhostCells like every
-         // other per-cell quantity in this file; not yet done. The cross
-         // terms below have the identical per-cell-only issue and are
-         // NOT fixed here, since they're currently negligible
-         // (cross/diag ~1e-25 in the last diagnostic run) -- revisit if
-         // that stops being true.
-         const bool hasXm = (stencil.i > 0),    hasXp = (stencil.i < lx-1);
-         const bool hasYm = (stencil.j > 0),    hasYp = (stencil.j < ly-1);
-         const bool hasZm = (stencil.k > 0),    hasZp = (stencil.k < lz-1);
-         const long long lidxXm = hasXm ? lidx-1     : lidx;
-         const long long lidxXp = hasXp ? lidx+1     : lidx;
-         const long long lidxYm = hasYm ? lidx-lx    : lidx;
-         const long long lidxYp = hasYp ? lidx+lx    : lidx;
-         const long long lidxZm = hasZm ? lidx-lx*ly : lidx;
-         const long long lidxZp = hasZp ? lidx+lx*ly : lidx;
+         // -div[(I + (dt^2/EPS_0) diag(mu)) grad phi], FACE-AVERAGED: the +x
+         // entry of this node and the -x entry of its +x neighbour describe the
+         // same face and must agree, so the coefficient at a face is the mean of
+         // the two adjacent nodes. mu is ghost-exchanged, so this is also
+         // symmetric across periodic seams and MPI rank boundaries.
+         const bool hasXm = stencil.cellExists(-1,0,0), hasXp = stencil.cellExists(1,0,0);
+         const bool hasYm = stencil.cellExists(0,-1,0), hasYp = stencil.cellExists(0,1,0);
+         const bool hasZm = stencil.cellExists(0,0,-1), hasZp = stencil.cellExists(0,0,1);
+         const size_t lidXm = hasXm ? stencil.indexFromOffset(-1,0,0) : lid;
+         const size_t lidXp = hasXp ? stencil.indexFromOffset(1,0,0)  : lid;
+         const size_t lidYm = hasYm ? stencil.indexFromOffset(0,-1,0) : lid;
+         const size_t lidYp = hasYp ? stencil.indexFromOffset(0,1,0)  : lid;
+         const size_t lidZm = hasZm ? stencil.indexFromOffset(0,0,-1) : lid;
+         const size_t lidZp = hasZp ? stencil.indexFromOffset(0,0,1)  : lid;
 
          const Real cxx_here = 1.0 + dt*dt*m[0]/physicalconstants::EPS_0;
          const Real cyy_here = 1.0 + dt*dt*m[4]/physicalconstants::EPS_0;
          const Real czz_here = 1.0 + dt*dt*m[8]/physicalconstants::EPS_0;
-         const Real cxx_xm = 1.0 + dt*dt*mu[lidxXm][0]/physicalconstants::EPS_0;
-         const Real cxx_xp = 1.0 + dt*dt*mu[lidxXp][0]/physicalconstants::EPS_0;
-         const Real cyy_ym = 1.0 + dt*dt*mu[lidxYm][4]/physicalconstants::EPS_0;
-         const Real cyy_yp = 1.0 + dt*dt*mu[lidxYp][4]/physicalconstants::EPS_0;
-         const Real czz_zm = 1.0 + dt*dt*mu[lidxZm][8]/physicalconstants::EPS_0;
-         const Real czz_zp = 1.0 + dt*dt*mu[lidxZp][8]/physicalconstants::EPS_0;
+         const Real cxx_xm = 1.0 + dt*dt*mu[lidXm][0]/physicalconstants::EPS_0;
+         const Real cxx_xp = 1.0 + dt*dt*mu[lidXp][0]/physicalconstants::EPS_0;
+         const Real cyy_ym = 1.0 + dt*dt*mu[lidYm][4]/physicalconstants::EPS_0;
+         const Real cyy_yp = 1.0 + dt*dt*mu[lidYp][4]/physicalconstants::EPS_0;
+         const Real czz_zm = 1.0 + dt*dt*mu[lidZm][8]/physicalconstants::EPS_0;
+         const Real czz_zp = 1.0 + dt*dt*mu[lidZp][8]/physicalconstants::EPS_0;
 
          const Real cxx_faceM = 0.5*(cxx_here+cxx_xm), cxx_faceP = 0.5*(cxx_here+cxx_xp);
          const Real cyy_faceM = 0.5*(cyy_here+cyy_ym), cyy_faceP = 0.5*(cyy_here+cyy_yp);
@@ -563,8 +652,8 @@ void ap_GaussLawCorrection(
          mv[5] = -czz_faceM/(dxyz[2]*dxyz[2]);
          mv[6] = -czz_faceP/(dxyz[2]*dxyz[2]);
 
-         // Cross terms from mu's off-diagonal
-         const Real cxy = dt*dt*0.5*(m[1]+m[3])/physicalconstants::EPS_0; // symmetrized off-diagonal
+         // Cross terms from mu's off-diagonal (symmetrised)
+         const Real cxy = dt*dt*0.5*(m[1]+m[3])/physicalconstants::EPS_0;
          const Real cxz = dt*dt*0.5*(m[2]+m[6])/physicalconstants::EPS_0;
          const Real cyz = dt*dt*0.5*(m[5]+m[7])/physicalconstants::EPS_0;
          const Real kxy = -cxy/(2*dxyz[0]*dxyz[1]);
@@ -574,30 +663,17 @@ void ap_GaussLawCorrection(
          mv[11]=mv[12] = kxz; mv[13]=mv[14] = -kxz;
          mv[15]=mv[16] = kyz; mv[17]=mv[18] = -kyz;
 
+         // div(E^k), centred differences of the node-centred E^k (ghost-exchanged).
          Real divE = 0.0;
-         // div(E^k) via centered differences of the three E components at
-         // this cell (E is edge-located; this samples eOld[] directly
-         // rather than through curlStencil). Uses eOld, NOT e: e is
-         // already E^{k+1} by this point (ap_SolveElectricField
-         // overwrites it in place before returning), so reading e here
-         // would compute div(E^{k+1}), not div(E^k) as the RHS formula
-         // (csl_rme_si_units.md Section 6) actually requires.
-         if (stencil.cellExists(1,0,0) && stencil.cellExists(-1,0,0)) {
-            divE += (eOld[stencil.indexFromOffset(1,0,0)][0] - eOld[stencil.indexFromOffset(-1,0,0)][0])/(2*dxyz[0]);
-         }
-         if (stencil.cellExists(0,1,0) && stencil.cellExists(0,-1,0)) {
-            divE += (eOld[stencil.indexFromOffset(0,1,0)][1] - eOld[stencil.indexFromOffset(0,-1,0)][1])/(2*dxyz[1]);
-         }
-         if (stencil.cellExists(0,0,1) && stencil.cellExists(0,0,-1)) {
-            divE += (eOld[stencil.indexFromOffset(0,0,1)][2] - eOld[stencil.indexFromOffset(0,0,-1)][2])/(2*dxyz[2]);
-         }
+         if (hasXp && hasXm) { divE += (Ek[lidXp][0] - Ek[lidXm][0])/(2*dxyz[0]); }
+         if (hasYp && hasYm) { divE += (Ek[lidYp][1] - Ek[lidYm][1])/(2*dxyz[1]); }
+         if (hasZp && hasZm) { divE += (Ek[lidZp][2] - Ek[lidZm][2])/(2*dxyz[2]); }
 
-         const Real rhoOverEpsRaw = moments[lid][fsgrids::moments::RHOQ]/physicalconstants::EPS_0;
+         const Real rhoOverEpsRaw = rho[lid][0]/physicalconstants::EPS_0;
          bvals[lidx] = (rhoOverEpsRaw - meanRhoOverEps) - divE; // Eq. 45 RHS, SI, rescaled by 1/EPS_0, rho mean-subtracted
       });
 
-   // Hand mvals/bvals to HYPRE via IJ, using dofBase for global
-   // row/column indices
+   // Hand mvals/bvals to HYPRE via IJ, using dofBase for global row/column indices
    HYPRE_IJMatrix Aij;
    HYPRE_IJMatrixCreate(MPI_COMM_WORLD, dofOffset, dofOffset+nlocal-1,
                          dofOffset, dofOffset+nlocal-1, &Aij);
@@ -742,22 +818,16 @@ void ap_GaussLawCorrection(
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
             const size_t lid = stencil.ooo();
             if (stencil.cellExists(1,0,0) && stencil.cellExists(-1,0,0)) {
-               const Real dEx = -0.5*(phiGrid[stencil.indexFromOffset(1,0,0)][0]-phiGrid[stencil.indexFromOffset(-1,0,0)][0])/dxyz[0];
-               e[lid][0] += dEx;
-               edt2[lid][0] += theta*dEx; // Eq. 40 consistency: E^{k+theta} only gets theta * the full E^{k+1} correction
+               Ekp1[lid][0] -= 0.5*(phiGrid[stencil.indexFromOffset(1,0,0)][0]-phiGrid[stencil.indexFromOffset(-1,0,0)][0])/dxyz[0];
             }
             if (stencil.cellExists(0,1,0) && stencil.cellExists(0,-1,0)) {
-               const Real dEy = -0.5*(phiGrid[stencil.indexFromOffset(0,1,0)][0]-phiGrid[stencil.indexFromOffset(0,-1,0)][0])/dxyz[1];
-               e[lid][1] += dEy;
-               edt2[lid][1] += theta*dEy;
+               Ekp1[lid][1] -= 0.5*(phiGrid[stencil.indexFromOffset(0,1,0)][0]-phiGrid[stencil.indexFromOffset(0,-1,0)][0])/dxyz[1];
             }
             if (stencil.cellExists(0,0,1) && stencil.cellExists(0,0,-1)) {
-               const Real dEz = -0.5*(phiGrid[stencil.indexFromOffset(0,0,1)][0]-phiGrid[stencil.indexFromOffset(0,0,-1)][0])/dxyz[2];
-               e[lid][2] += dEz;
-               edt2[lid][2] += theta*dEz;
+               Ekp1[lid][2] -= 0.5*(phiGrid[stencil.indexFromOffset(0,0,1)][0]-phiGrid[stencil.indexFromOffset(0,0,-1)][0])/dxyz[2];
             }
          });
-      fsgrid.updateGhostCells(e);
+      fsgrid.updateGhostCells(Ekp1);
 
    } else if (myRank == MASTER_RANK) {
       fprintf(stderr, "apGaussLawCorrection: relres=%e > 1.0 -- solve diverged, "
@@ -766,11 +836,11 @@ void ap_GaussLawCorrection(
 }
 
 /* ============================================================
- * Section 6: propagateFields entry point
+ * Section 6: diagnostics and the optional low-pass filter
  * ============================================================ */
 
 // Reports max|E| (over all 3 components, all local cells)
-static void ap_ReportFieldMagnitude(const char* label, fsgrids::constefieldspan field,
+static void ap_ReportFieldMagnitude(const char* label, std::span<const ApVec3> field,
                                      fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
    int myRank; MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
    double maxAbsLocal[3] = {0.0, 0.0, 0.0};
@@ -798,15 +868,14 @@ static void ap_ReportFieldMagnitude(const char* label, fsgrids::constefieldspan 
    }
 }
 
-// Low-pass filter, 3-point binomial with alpha=1/2
-// Transfer function T(k) = cos^2(k*dx/2)
-// Two-pass: computes every filtered value into a local buffer reading
-// neighbors from the original, then copies the buffer back.
-template<typename SpanType>
-static void ap_ApplyLowPassFilter1D(SpanType field, int axis, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+// Low-pass filter, 3-point binomial with alpha=1/2 (transfer function
+// cos^2(k*dx/2)). Two-pass: every filtered value is computed from the
+// original, then copied back. Not part of the paper; off unless
+// fieldsolver.lowPassFilter is set.
+static void ap_ApplyLowPassFilter1D(std::span<ApVec3> field, int axis, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
    const auto localSize = fsgrid.getLocalSize();
    const int lx = localSize[0], ly = localSize[1], lz = localSize[2];
-   std::vector<std::array<Real,3>> filtered((size_t)lx*ly*lz);
+   std::vector<ApVec3> filtered((size_t)lx*ly*lz);
 
    std::array<int,3> plusOffset{0,0,0};  plusOffset[axis]  =  1;
    std::array<int,3> minusOffset{0,0,0}; minusOffset[axis] = -1;
@@ -823,10 +892,7 @@ static void ap_ApplyLowPassFilter1D(SpanType field, int axis, fsgrids::technical
          const size_t minusLid = minusExists ? stencil.indexFromOffset(minusOffset[0], minusOffset[1], minusOffset[2]) : lid;
          const size_t plusLid  = plusExists  ? stencil.indexFromOffset(plusOffset[0],  plusOffset[1],  plusOffset[2])  : lid;
          for (int comp = 0; comp < 3; ++comp) {
-            Real val = 0.5 * field[lid][comp];
-            val += 0.25 * field[minusLid][comp];
-            val += 0.25 * field[plusLid][comp];
-            filtered[lidx][comp] = val;
+            filtered[lidx][comp] = 0.5*field[lid][comp] + 0.25*field[minusLid][comp] + 0.25*field[plusLid][comp];
          }
       });
 
@@ -837,20 +903,21 @@ static void ap_ApplyLowPassFilter1D(SpanType field, int axis, fsgrids::technical
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
          const size_t lid = stencil.ooo();
          const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
-         for (int comp = 0; comp < 3; ++comp) {
-            field[lid][comp] = filtered[lidx][comp];
-         }
+         for (int comp = 0; comp < 3; ++comp) { field[lid][comp] = filtered[lidx][comp]; }
       });
    fsgrid.updateGhostCells(field);
 }
 
 // Separable filter in all three dimensions
-template<typename SpanType>
-static void ap_ApplyLowPassFilter3D(SpanType field, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
-   ap_ApplyLowPassFilter1D(field, 0, technical, fsgrid); // x
-   ap_ApplyLowPassFilter1D(field, 1, technical, fsgrid); // y
-   ap_ApplyLowPassFilter1D(field, 2, technical, fsgrid); // z
+static void ap_ApplyLowPassFilter3D(std::span<ApVec3> field, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   ap_ApplyLowPassFilter1D(field, 0, technical, fsgrid);
+   ap_ApplyLowPassFilter1D(field, 1, technical, fsgrid);
+   ap_ApplyLowPassFilter1D(field, 2, technical, fsgrid);
 }
+
+/* ============================================================
+ * Section 7: propagateFields entry point
+ * ============================================================ */
 
 bool ap_propagateFields(fsgrids::perbspan perb,
                      fsgrids::perbspan perbdt2,
@@ -873,68 +940,93 @@ bool ap_propagateFields(fsgrids::perbspan perb,
       bailout(true, s.str(), __FILE__, __LINE__);
    }
 
+   // Derivatives of the Yee-lattice perb and of the moments, plus vol's derivative
+   // and curvature slots (computed from vol's own PERB?VOL, on the same one-step
+   // lag as for the other field solvers). Nothing in the solver below reads dperb.
    calculateDerivativesSimple(perb, moments, dperb, dmoments, technical, fsgrid, false);
    fsgrid.updateGhostCells(dperb);
 
    const Real theta = P::FieldSolverTheta;
    const Real c = physicalconstants::LIGHT_SPEED;
 
+   ApNodeState& state = ap_GetNodeState(perb, e, technical, fsgrid, dt==0.0);
+
    // dt==0 special case: vlasiator.cpp calls this once before the main loop
    // specifically for one-time setup. ap_SolveElectricField divides by dt and
-   // dt^2 in multiple places, so calling it with dt=0 produces inf/NaN, which
-   // then gets written into e and read back as the "initial guess" Ek on every
-   // subsequent real solve
-   // FIXME: This is done to get the timestep limit of the fieldsolver to the
+   // dt^2, so nothing is advanced. The initial node-centred fields are
+   // published to vol (the Vlasov solver reads them from there); the Yee arrays
+   // are left exactly as the project set them.
+   // FIXME: This is also how the timestep limit of the fieldsolver gets to the
    // rest of the code, but what ARE the timestep limits?
-   bool converged = true;
-   if (dt != 0.0) {
-
-      std::vector<std::array<Real,9>> mu;
-      std::vector<std::array<Real,3>> Jhat;
-      ap_BuildSpeciesTensors(speciesRhoQ, speciesJ, perb, bgb, technical, fsgrid, theta, dt, mu, Jhat);
-
-      // Snapshot E^k into its own storage BEFORE the solve overwrites e
-      // in place with E^{k+1}.
-      fsgrid::FsData<std::array<Real, fsgrids::efield::N_EFIELD>> eOldSnapshot(fsgrid.getNumStorageCells());
-      fsgrid.serial_for(
+   if (dt == 0.0) {
+      fsgrid.parallel_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
-         phiprof::initializeTimer("AP: snapshot E^k"), technical,
+         phiprof::initializeTimer("AP: initial half-step Yee arrays"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
             const size_t lid = stencil.ooo();
-            eOldSnapshot[lid][0] = e[lid][0];
-            eOldSnapshot[lid][1] = e[lid][1];
-            eOldSnapshot[lid][2] = e[lid][2];
+            perbdt2[lid] = perb[lid];
+            edt2[lid]    = e[lid];
          });
-
-      converged = ap_SolveElectricField(e, edt2, perb, bgb, dperb, mu, Jhat, technical, fsgrid, c, theta, dt);
-      ap_ReportFieldMagnitude("ap_propagateFields: after raw solve (e)", e, technical, fsgrid);
-
-      if (P::apLowPassFilter) {
-         ap_ApplyLowPassFilter3D(e, technical, fsgrid);
-         ap_ApplyLowPassFilter3D(edt2, technical, fsgrid); // same filter, now also applied to E^{k+theta}
-      }
-
-      if (P::apEnforceGaussLaw) {
-         ap_GaussLawCorrection(e, edt2, eOldSnapshot.view(), moments, mu, technical, fsgrid, theta, dt);
-      }
-
-      ap_StageElectricFieldForAcceleration(edt2, vol, technical, fsgrid);
+      fsgrid.updateGhostCells(perbdt2);
+      fsgrid.updateGhostCells(edt2);
+      ap_PublishToVol(state.B.view(), state.E.view(), vol, technical, fsgrid);
+      return true;
    }
 
-   ap_UpdateMagneticField(perb, perbdt2, edt2 /* = E^{k+theta} */, technical, fsgrid, theta, dt);
+   const size_t nStorage = fsgrid.getNumStorageCells();
+   fsgrid::FsData<std::array<Real,9>> mu(nStorage);
+   ApNodeField Jhat(nStorage);
+   ap_BuildSpeciesTensors(speciesRhoQ, speciesJ, state.B.view(), bgb, technical, fsgrid, theta, dt, mu, Jhat);
 
-   // Populate vol's dPERB?VOLd? and CURVATURE?  from perbdt2/edt2
-   // (B^{k+theta}/E^{k+theta}).  This call ALSO writes vol's
-   // PERBXVOL/YVOL/ZVOL and EXVOL/ YVOL/ZVOL so we rewrite those immediately
-   // below.
-   calculateVolumeAveragedFieldsSimple(perbdt2, edt2, dperb, vol, technical, fsgrid);
-   ap_StageMagneticFieldForAcceleration(perbdt2, vol, technical, fsgrid);
-   ap_StageElectricFieldForAcceleration(edt2, vol, technical, fsgrid);
+   // Step (2b): E^{k+theta} from Eq. (38), E^{k+1} from Eq. (40)
+   ApNodeField Etheta(nStorage), Ekp1(nStorage), Btheta(nStorage), Bkp1(nStorage);
+   const bool converged = ap_SolveElectricField(state.E.view(), state.B.view(), bgb, mu.view(), Jhat.view(),
+                                                Etheta.view(), Ekp1.view(), technical, fsgrid, c, theta, dt);
+   ap_ReportFieldMagnitude("ap_propagateFields: after raw solve (E^{k+theta})", Etheta.view(), technical, fsgrid);
 
    if (P::apLowPassFilter) {
-      ap_ApplyLowPassFilter3D(perb, technical, fsgrid);
+      ap_ApplyLowPassFilter3D(Etheta.view(), technical, fsgrid);
+      ap_ApplyLowPassFilter3D(Ekp1.view(), technical, fsgrid);
    }
+
+   // Step (2c): B^{k+1} from Eq. (23), B^{k+theta} from Eq. (39)
+   ap_UpdateMagneticField(state.B.view(), Etheta.view(), Bkp1.view(), Btheta.view(), technical, fsgrid, theta, dt);
+
+   // Step (2d): Gauss correction of E^{k+1} only. rho^k is the total charge density
+   // at the start of the step, the same speciesRhoQ that defines mu (Eq. 36).
+   if (P::apEnforceGaussLaw) {
+      fsgrid::FsData<std::array<Real,1>> rho(nStorage);
+      fsgrid.parallel_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("AP: total rho^k"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            const size_t lid = stencil.ooo();
+            Real sum = 0.0;
+            for (size_t popID = 0; popID < speciesRhoQ.size(); ++popID) {
+               sum += speciesRhoQ[popID][lid][fsgrids::speciesrhoq::SRHOQ];
+            }
+            rho[lid][0] = sum;
+         });
+      ap_GaussLawCorrection(Ekp1.view(), state.E.view(), rho.view(), mu.view(), technical, fsgrid, dt);
+   }
+
+   if (P::apLowPassFilter) {
+      ap_ApplyLowPassFilter3D(Bkp1.view(), technical, fsgrid);
+      ap_ApplyLowPassFilter3D(Btheta.view(), technical, fsgrid);
+   }
+
+   // Hand-off to the Vlasov solver (Eq. 20): E^{k+theta}, B^{k+theta} straight into vol.
+   ap_PublishToVol(Btheta.view(), Etheta.view(), vol, technical, fsgrid);
+
+   // Yee-lattice quantities for output and for everything else that expects them.
+   ap_NodesToYee(Btheta.view(), Etheta.view(), perbdt2, edt2, technical, fsgrid); // time level k+theta
+   ap_NodesToYee(Bkp1.view(),   Ekp1.view(),   perb,    e,    technical, fsgrid); // time level k+1
+
+   // The corrected E^{k+1} and B^{k+1} become E^k and B^k of the next step.
+   state.E.swap(Ekp1);
+   state.B.swap(Bkp1);
 
    return converged;
 }
