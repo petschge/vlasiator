@@ -322,18 +322,29 @@ bool map_1d(SpatialCell* spatial_cell,
          firstBlockIndexK = (firstBlockIndexK < max_v_length ) ? firstBlockIndexK : max_v_length - 1;
          lastBlockIndexK  = (lastBlockIndexK  >= 0)            ? lastBlockIndexK  : 0;
          lastBlockIndexK  = (lastBlockIndexK  < max_v_length ) ? lastBlockIndexK  : max_v_length - 1;
-         if(firstBlockIndexK < wallmargin
-            || firstBlockIndexK >= max_v_length - wallmargin
-            || lastBlockIndexK < wallmargin
-            || lastBlockIndexK >= max_v_length - wallmargin
-         ) {
+         const bool hitLowWall  = (firstBlockIndexK < wallmargin) || (lastBlockIndexK < wallmargin);
+         const bool hitHighWall = (firstBlockIndexK >= max_v_length - wallmargin) || (lastBlockIndexK >= max_v_length - wallmargin);
+         if (hitLowWall || hitHighWall) {
+            // dimension is 0/1/2 for x/y/z (see the three map_1d call sites in
+            // cpu_acc_semilag.cpp, each passing its own axis explicitly); low
+            // vs high come from which side(s) of the wallmargin check above
+            // actually fired -- both can fire together for a large enough
+            // shift, so both are reported if so, not just the first found.
+            static const char* axisNames[3] = {"vx", "vy", "vz"};
+            const char* axisName = (dimension < 3) ? axisNames[dimension] : "v?";
+            string directions;
+            if (hitLowWall)  { directions += string("-") + axisName; }
+            if (hitHighWall) { if (!directions.empty()) { directions += ", "; } directions += string("+") + axisName; }
+
             string message = "Some target blocks in acceleration are going to be less than ";
             message += std::to_string(wallmargin);
             message += " blocks away from the current velocity space walls for population ";
             message += getObjectWrapper().particleSpecies[popID].name;
             message += " at CellID ";
             message += std::to_string(static_cast<int>(spatial_cell->parameters[CellParams::CELLID]));
-            message += ". Consider expanding velocity space for that population.";
+            message += " (direction(s): ";
+            message += directions;
+            message += "). Consider expanding velocity space for that population.";
             bailout(true, message, __FILE__, __LINE__);
          }
 
