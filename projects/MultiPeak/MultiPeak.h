@@ -97,8 +97,19 @@ namespace projects {
 
       enum densitymodel {
          Uniform,
-         TestCase
+         TestCase,
+         Slab
       } densityModel;
+      // Slab density model (added for the POS test, Liu et al. 2025 Sec. 5.3):
+      // rho = rho_peaks inside [slabMinX, slabMaxX], 0 outside. x only, since
+      // the model is 1D; a cell is "inside" by its centre coordinate.
+      Real slabMinX;
+      Real slabMaxX;
+      // Width of a smooth tanh transition at each slab edge, instead of a
+      // literal step. 0.0 (default) keeps the exact original hard-step
+      // behaviour, bit for bit -- see the two switch(densityModel) cases
+      // below for why a nonzero width matters at all.
+      Real slabTransitionWidth;
 
    }; // class MultiPeak
 } //  namespace projects
