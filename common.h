@@ -525,6 +525,8 @@ namespace sysboundarytype {
       OUTFLOW,          /*!< No fixed conditions on the fields and distribution function. */
       MAXWELLIAN,       /*!< Set Maxwellian boundary condition, i.e. set fields and distribution function. */
       COPYSPHERE,       /*!< A sphere with copy-condition for perturbed B as the simple inner boundary */
+      CONDUCTINGWALL,   /*!< A planar perfectly-conducting wall: zero normal B, zero tangential E,
+                              specular reflection (mirrored wall-normal velocity) for particles. */
       OUTER_BOUNDARY_PADDING, /*!< These cells only occur on FSGrid, where boundaries are not at the highest refinement level */
       N_SYSBOUNDARY_CONDITIONS
    };

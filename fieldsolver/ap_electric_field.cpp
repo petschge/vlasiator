@@ -145,18 +145,23 @@ static void ap_YeeToNodes(fsgrids::perbspan perb, fsgrids::efieldspan e,
       phiprof::initializeTimer("AP: Yee -> node"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
          const size_t lid = stencil.ooo();
          for (int c = 0; c < 3; ++c) {
             Real acc = 0.0; int n = 0;
             for (const auto& o : cellFaceOffsets(c)) {
                if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
-               acc += perb[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+               const size_t nlid = stencil.indexFromOffset(o[0],o[1],o[2]);
+               if (technical[nlid].sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || technical[nlid].sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { continue; }
+               acc += perb[nlid][c]; ++n;
             }
             Bn[lid][c] = n > 0 ? acc/n : perb[lid][c];
             acc = 0.0; n = 0;
             for (const auto& o : cellEdgeOffsets(c)) {
                if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
-               acc += e[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+               const size_t nlid = stencil.indexFromOffset(o[0],o[1],o[2]);
+               if (technical[nlid].sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || technical[nlid].sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { continue; }
+               acc += e[nlid][c]; ++n;
             }
             En[lid][c] = n > 0 ? acc/n : e[lid][c];
          }
@@ -175,18 +180,23 @@ static void ap_NodesToYee(std::span<const ApVec3> Bn, std::span<const ApVec3> En
       phiprof::initializeTimer("AP: node -> Yee"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
          const size_t lid = stencil.ooo();
          for (int c = 0; c < 3; ++c) {
             Real acc = 0.0; int n = 0;
             for (const auto& o : faceCellOffsets(c)) {
                if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
-               acc += Bn[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+               const size_t nlid = stencil.indexFromOffset(o[0],o[1],o[2]);
+               if (technical[nlid].sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || technical[nlid].sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { continue; }
+               acc += Bn[nlid][c]; ++n;
             }
             perbOut[lid][c] = n > 0 ? acc/n : Bn[lid][c];
             acc = 0.0; n = 0;
             for (const auto& o : edgeCellOffsets(c)) {
                if (!stencil.cellExists(o[0],o[1],o[2])) { continue; }
-               acc += En[stencil.indexFromOffset(o[0],o[1],o[2])][c]; ++n;
+               const size_t nlid = stencil.indexFromOffset(o[0],o[1],o[2]);
+               if (technical[nlid].sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || technical[nlid].sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { continue; }
+               acc += En[nlid][c]; ++n;
             }
             eOut[lid][c] = n > 0 ? acc/n : En[lid][c];
          }
@@ -217,6 +227,7 @@ static void ap_PublishToVol(std::span<const ApVec3> B, std::span<const ApVec3> E
       phiprof::initializeTimer("AP: publish fields to vol"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
          const size_t lid = stencil.ooo();
          vol[lid][fsgrids::volfields::PERBXVOL] = B[lid][0];
          vol[lid][fsgrids::volfields::PERBYVOL] = B[lid][1];
@@ -252,6 +263,7 @@ void ap_BuildSpeciesTensors(
       technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
 
          const size_t lid = stencil.ooo();
 
@@ -321,6 +333,7 @@ bool ap_SolveElectricField(
    std::span<ApVec3> Ekp1,     // out: E^{k+1}  (Eq. 40)
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
+   SysBoundary& sysBoundaries,
    Real c,
    Real theta,
    Real dt
@@ -330,6 +343,14 @@ bool ap_SolveElectricField(
    const int lx = localSize[0], ly = localSize[1], lz = localSize[2];
    const long long nLocalCells = (long long)lx*ly*lz;
    const long long nLocalDofs  = 3*nLocalCells;
+
+   // Safeguard for fieldsolver.outflowAbsorbing (see parameters.h): the
+   // Ey=c*Bz, Ez=-c*By absorbing condition below is derived assuming an
+   // x-normal face and is not valid as written for a y- or z-facing
+   // Outflow boundary, so only ever apply it on a genuinely 1D-in-x grid.
+   const auto globalSizeForAbsorbing = fsgrid.getGlobalSize();
+   const bool outflowAbsorbingActive =
+      P::apOutflowAbsorbing && globalSizeForAbsorbing[1] == 1 && globalSizeForAbsorbing[2] == 1;
 
    // ---- Step 1: global DOF numbering (contiguous per rank by construction) ----
    long long dofOffset = 0;
@@ -386,8 +407,90 @@ bool ap_SolveElectricField(
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
 
-         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE) { return; }
          const size_t lid = stencil.ooo();
+
+         // IDENTITY ROW: ionospheric-radius interior / fsgrid-only padding,
+         // nothing physical to solve, and no SysBoundaryCondition object to
+         // dispatch to either -- the legacy LDZ solver never calls
+         // getSysBoundary() for these flags (ldz_calculateElectricField
+         // returns before reaching its own dispatch), so this stays a
+         // literal, undispatched 0. Direct-pin both E arrays here rather
+         // than leaving it to Eq. 40 in the extraction loop below: that
+         // formula gives (0-Ek)*(1-1/theta), which is only exactly 0 for
+         // theta==1 (true for the POS cfg, but not in general) or Ek==0 --
+         // pinning both arrays directly is correct for every theta.
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) {
+            for (int comp = 0; comp < 3; ++comp) {
+               Etheta[lid][comp] = 0.0;
+               Ekp1[lid][comp]   = 0.0;
+               const HYPRE_BigInt row = globalDof(lid, comp);
+               HYPRE_Int one = 1;
+               const HYPRE_Real diag = 1.0, zero = 0.0;
+               HYPRE_IJMatrixSetValues(Aij, 1, &one, &row, &row, &diag);
+               HYPRE_IJVectorSetValues(bij, 1, &row, &zero);
+               HYPRE_IJVectorSetValues(xij, 1, &row, &zero);
+            }
+            return;
+         }
+
+         // IDENTITY ROW: genuine boundary cell (Maxwellian, Outflow, ...).
+         // Ask the actual boundary condition what E should be here, exactly
+         // as ldz_calculateElectricField does -- not a hard-coded 0, even
+         // though every type this solver currently targets (Maxwellian,
+         // Outflow) happens to always return 0 (see inflow.cpp, outflow.cpp)
+         // -- so this stays correct if a type that doesn't is added later.
+         // fieldSolverBoundaryCondElectricField mutates its span argument in
+         // place at stencil.ooo(); called directly on Etheta/Ekp1 (both
+         // std::span<std::array<Real,3>>, the same underlying type as
+         // fsgrids::efieldspan), so both are pinned with no extra copying.
+         // Direct pinning: Ekp1 is set this way too, not via Eq. 40.
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) {
+            // fieldsolver.outflowAbsorbing (see parameters.h): for an
+            // Outflow cell specifically, replace the dispatched E=0 with
+            // the absorbing condition for a rightward-propagating vacuum
+            // wave, Ey=c*Bz, Ez=-c*By -- derived directly from the vacuum
+            // wave equation (dBz/dt=-dEy/dx, dEy/dt=-c^2 dBz/dx -> a
+            // rightward travelling solution satisfies Ey=c*Bz exactly),
+            // and consistent with the SAME relationship already used to
+            // derive the driven x- boundary's own Bz(t)=Ey_in(t)/c. E=0
+            // is correct for LAUNCHING a wave at a driving boundary
+            // (paired with a time-dependent Bz(t)), but has no physical
+            // justification at an undriven Outflow face: it is the
+            // boundary condition for a perfectly-conducting wall, not an
+            // absorbing one, and reflects whatever reaches it. Ex (the
+            // face-normal component) is untouched -- this transverse-wave
+            // relationship says nothing about the normal component, so it
+            // keeps the existing (0) dispatch. Uses Bk (this step's B^k,
+            // the only B available yet -- ap_UpdateMagneticField, which
+            // computes this step's B^{k+theta}/B^{k+1}, hasn't run yet at
+            // this point in ap_propagateFields): a one-step lag, same
+            // spirit as 0008's own direct-pinning lag for Outflow's B.
+            const bool useAbsorbing = outflowAbsorbingActive && (sysBoundaryFlag == sysboundarytype::OUTFLOW);
+            // bc is needed regardless of useAbsorbing: comp==0 (Ex) always
+            // goes through the real dispatch below, even on an Outflow
+            // cell with the absorbing condition active for comp 1 and 2.
+            SBC::SysBoundaryCondition* bc = sysBoundaries.getSysBoundary(sysBoundaryFlag);
+            for (int comp = 0; comp < 3; ++comp) {
+               if (useAbsorbing && comp == 1) {
+                  Etheta[lid][1] = c * Bk[lid][2];
+                  Ekp1[lid][1]   = c * Bk[lid][2];
+               } else if (useAbsorbing && comp == 2) {
+                  Etheta[lid][2] = -c * Bk[lid][1];
+                  Ekp1[lid][2]   = -c * Bk[lid][1];
+               } else {
+                  bc->fieldSolverBoundaryCondElectricField(Etheta, stencil, comp);
+                  bc->fieldSolverBoundaryCondElectricField(Ekp1, stencil, comp);
+               }
+               const HYPRE_BigInt row = globalDof(lid, comp);
+               HYPRE_Int one = 1;
+               const HYPRE_Real diag = 1.0;
+               const HYPRE_Real bval = (HYPRE_Real)Etheta[lid][comp];
+               HYPRE_IJMatrixSetValues(Aij, 1, &one, &row, &row, &diag);
+               HYPRE_IJVectorSetValues(bij, 1, &row, &bval);
+               HYPRE_IJVectorSetValues(xij, 1, &row, &bval);
+            }
+            return;
+         }
 
          for (int comp = 0; comp < 3; ++comp) {
             const HYPRE_BigInt row = globalDof(lid, comp);
@@ -463,6 +566,11 @@ bool ap_SolveElectricField(
       phiprof::initializeTimer("AP: extract E^(k+theta), compute E^(k+1)"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         // Boundary-flagged cells (uncomputed or genuine) were already fully
+         // pinned, both arrays, during assembly above -- Eq. 40 is only
+         // valid for an interior cell's own E^k, not a value sourced from a
+         // boundary condition or held at 0 by convention.
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
          const size_t lid = stencil.ooo();
          for (int comp = 0; comp < 3; ++comp) {
             const HYPRE_BigInt row = globalDof(lid, comp);
@@ -495,17 +603,23 @@ void ap_UpdateMagneticField(
    std::span<const ApVec3> Etheta,
    std::span<ApVec3> Bkp1,
    std::span<ApVec3> Btheta,
+   fsgrids::constbgbspan bgb,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
+   SysBoundary& sysBoundaries,
    Real theta,
    Real dt
 ) {
    const auto dxyz = fsgrid.getGridSpacing();
+   // Pass 1: interior (NOT_SYSBOUNDARY) cells only, via the centred curl
+   // (Eq. 23/39). Boundary-flagged cells, uncomputed or genuine, are left
+   // for pass 2 below.
    fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
-      phiprof::initializeTimer("AP: Faraday update"), technical,
+      phiprof::initializeTimer("AP: Faraday update, interior"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
          const size_t lid = stencil.ooo();
          for (int comp = 0; comp < 3; ++comp) {
             Real curlE = 0.0;
@@ -517,6 +631,42 @@ void ap_UpdateMagneticField(
             const Real Bk1 = Bkc - dt*curlE;                    // Eq. 23
             Bkp1[lid][comp]   = Bk1;                            // B^{k+1}
             Btheta[lid][comp] = theta*Bk1 + (1.0-theta)*Bkc;    // Eq. 39
+         }
+      });
+   // Ghost-exchange before pass 2, so a boundary cell's "nearest solving
+   // neighbour" lookup (Outflow) sees pass 1's freshly computed Bkp1 at
+   // every interior cell, including ones owned by a neighbouring rank --
+   // not the previous step's Bk. ldz_magnetic_field.cpp does the same
+   // between its own L1 and L2 passes, for the same reason.
+   fsgrid.updateGhostCells(Bkp1);
+
+   // Pass 2: boundary-flagged cells. Uncomputed cells (no dispatchable
+   // SysBoundaryCondition -- see the matching note in ap_SolveElectricField)
+   // are left untouched, same as pass 1 skipped them. Genuine boundary
+   // cells are DIRECTLY PINNED (for now): both Bkp1 and Btheta take
+   // fieldSolverBoundaryCondMagneticField's value, rather than deriving
+   // Btheta from Bkp1 via the interior theta-blend formula. The lookup
+   // array passed in is Bkp1 itself (perbspan demands non-const; Bk is
+   // const and won't bind) -- correct for a single boundary layer thanks
+   // to the ghost exchange above, but unlike the legacy solver's own
+   // two-sysBoundaryLayer L1/L2 split, a layer-2 cell whose nearest
+   // solving neighbour is itself another boundary cell is not specially
+   // handled yet.
+   fsgrid.parallel_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("AP: Faraday update, boundary"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag == sysboundarytype::NOT_SYSBOUNDARY) { return; }
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
+         const size_t lid = stencil.ooo();
+         const auto globalCoordinates = coordinates.localToGlobal(stencil.i, stencil.j, stencil.k);
+         SBC::SysBoundaryCondition* bc = sysBoundaries.getSysBoundary(sysBoundaryFlag);
+         for (int comp = 0; comp < 3; ++comp) {
+            const Real val = bc->fieldSolverBoundaryCondMagneticField(
+               Bkp1, bgb, technical, dxyz, globalCoordinates, stencil, comp);
+            Bkp1[lid][comp]   = val;
+            Btheta[lid][comp] = val;  // direct pinning, not the theta-blend formula
          }
       });
    fsgrid.updateGhostCells(Bkp1);
@@ -543,7 +693,6 @@ void ap_GaussLawCorrection(
    int myRank;
    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
 
-   const auto& globalSize = fsgrid.getGlobalSize();
    const auto  localSize  = fsgrid.getLocalSize();
    const auto  dxyz       = fsgrid.getGridSpacing();
    const int lx=localSize[0], ly=localSize[1], lz=localSize[2];
@@ -586,21 +735,73 @@ void ap_GaussLawCorrection(
       {0,1,1},{0,-1,-1},{0,1,-1},{0,-1,1}
    };
 
+   // Local-only (nlocal-sized, no ghosts) per-cell flag, 1 for NOT_SYSBOUNDARY,
+   // populated during the assembly loop below. Needed so the mean-phi
+   // subtraction further down -- a bare sequential loop over phiLocal, with
+   // no sysBoundaryFlag of its own -- can also restrict to interior cells;
+   // phiLocal is indexed by lidx (a *local-only* linear index), which is a
+   // different index space from technical's (ghost-inclusive) stencil.ooo(),
+   // so technical[] can't just be read directly at a lidx.
    std::vector<double> mvals(nStencil*nlocal, 0.0), bvals(nlocal, 0.0);
    double meanRhoOverEps = 0.0;
+   double nInteriorGlobal = 0.0;
+   bool hasAnchorGlobal = false;  // true if any boundary-flagged (Dirichlet-pinned) cell exists anywhere
    {
-      double sumRho_local = 0.0;
+      // Mean-subtracting rho (and, further down, phi) is NOT part of the
+      // paper's Eq. (45) -- it is an addition needed only for a FULLY
+      // PERIODIC domain (no boundary cells anywhere), where the Poisson
+      // operator has a 1D null space (a constant shift of phi solves the
+      // homogeneous problem) and the system is singular unless the RHS is
+      // made to integrate to zero. A domain with at least one genuine
+      // boundary-flagged cell already has a Dirichlet pin (that cell's own
+      // phi=0 identity row, from the IDENTITY ROW branch below) breaking
+      // that null space -- the system is already well-posed, and adding a
+      // domain-wide mean-rho subtraction on top does not fix anything
+      // there; it SUBTRACTS A SPURIOUS, GENERALLY LARGE CONSTANT (order
+      // rho_slab/2 for a domain that's roughly half plasma, half vacuum,
+      // like this test) from the RHS EVERYWHERE, including the vacuum
+      // region where the true RHS is ~0 -- confirmed to be the actual
+      // cause of a Plasma Opening Switch run bailing out on literally its
+      // first step: the resulting phi (order rho*L_vacuum^2/eps0, an
+      // order-of-magnitude match to the max|phi| actually observed) has
+      // nothing to do with any real dynamics, since it only depends on the
+      // (mean-subtracted) initial rho and reproduces with Ek=0 exactly.
+      // So: check once whether ANY boundary-flagged cell exists anywhere
+      // in the domain (an MPI_Allreduce over a local 0/1 flag -- global,
+      // not per-rank, since a Dirichlet pin on one rank anchors the WHOLE
+      // coupled system, not just that rank's local piece of it), and only
+      // compute+apply the mean-subtraction when none do.
+      double sumRho_local = 0.0, nInterior_local = 0.0;
+      bool hasAnchor_local = false;
+      // DIAGNOSTIC (debugging a POS bailout, not part of the fix above):
+      // max|rho/eps0| and roughly where it occurs, over NOT_SYSBOUNDARY
+      // cells. Rank-local x only (no cross-rank argmax reduction) -- exact
+      // for the single-rank runs this is being debugged with; for a
+      // multi-rank run, read it as "the worst cell on rank 0" specifically.
+      double maxAbsRhoOverEps_local = 0.0, xAtMax_local = 0.0;
       fsgrid.serial_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
          phiprof::initializeTimer("AP: compute mean(rho)"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-            sumRho_local += rho[stencil.ooo()][0] / physicalconstants::EPS_0;
+            if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { hasAnchor_local = true; return; }
+            const Real rhoOverEpsHere = rho[stencil.ooo()][0] / physicalconstants::EPS_0;
+            sumRho_local += rhoOverEpsHere;
+            nInterior_local += 1.0;
+            if (std::fabs(rhoOverEpsHere) > std::fabs(maxAbsRhoOverEps_local)) {
+               maxAbsRhoOverEps_local = rhoOverEpsHere;
+               xAtMax_local = coordinates.getPhysicalCoords(stencil.i, stencil.j, stencil.k)[0];
+            }
          });
       double sumRho_global = 0.0;
       MPI_Allreduce(&sumRho_local, &sumRho_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-      const double totalPoints = (double)globalSize[0] * (double)globalSize[1] * (double)globalSize[2];
-      meanRhoOverEps = sumRho_global / totalPoints;
+      MPI_Allreduce(&nInterior_local, &nInteriorGlobal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      MPI_Allreduce(&hasAnchor_local, &hasAnchorGlobal, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
+      meanRhoOverEps = hasAnchorGlobal ? 0.0 : (sumRho_global / nInteriorGlobal);
+      int myRankForDiag; MPI_Comm_rank(MPI_COMM_WORLD, &myRankForDiag);
+      fprintf(stderr, "apGaussLawCorrection: rank %d: max|rho/eps0|=%e at x=%e m (hasAnchor=%d, meanRhoOverEps=%e)\n",
+              myRankForDiag, (double)maxAbsRhoOverEps_local, (double)xAtMax_local,
+              hasAnchorGlobal ? 1 : 0, meanRhoOverEps);
    }
 
    fsgrid.serial_for(
@@ -610,6 +811,42 @@ void ap_GaussLawCorrection(
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
          const size_t lid = stencil.ooo();
          const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
+
+         // IDENTITY ROW: phi = 0 at any cell this correction doesn't apply
+         // to -- DO_NOT_COMPUTE/OUTER_BOUNDARY_PADDING (nothing physical
+         // here at all) and genuine boundary cells alike (Maxwellian,
+         // Outflow, ...: their E was already finalised by
+         // ap_SolveElectricField's own identity-row dispatch, so there's no
+         // meaningful correction to solve for there either -- there's no
+         // fieldSolverBoundaryCondPhi-style API to dispatch through even if
+         // there were, since this correction is unique to this solver).
+         // mvals/bvals already default-initialise to 0, so only the
+         // diagonal needs setting.
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) {
+            mvals[nStencil*lidx + 0] = 1.0;
+            return;
+         }
+
+         // EXPLICIT REGULARISATION for a fully periodic domain (!hasAnchorGlobal,
+         // checked above): no genuine boundary cell exists anywhere to supply the identity
+         // row above, so without this the matrix is exactly singular (a uniform shift of phi
+         // solves the homogeneous problem -- this operator is a divergence of (mu-dependent)
+         // gradient, and grad(constant)=0 regardless of the coefficient multiplying it). The
+         // existing mean-subtraction of rho (this function, above) and of phi (previously
+         // applied after the solve) keep the compatibility condition satisfied and pick the
+         // zero-mean representative of the solution family -- correct in exact arithmetic, but
+         // relies on PCG's Krylov iterates never acquiring a null-space component, which in
+         // turn relies on this matrix being exactly symmetric. It isn't: the cross terms a few
+         // lines below (kxy/kxz/kyz, from mu's off-diagonal components) are built from mu at
+         // THIS cell only, not face-averaged with the neighbour the way the diagonal cxx/cyy/
+         // czz terms explicitly are just above -- so where mu varies between neighbouring
+         // cells (it does, sharply, near either Harris sheet), the coefficient from cell A to
+         // cell B generally differs from B back to A.
+         if (!hasAnchorGlobal && dofOffset + lidx == 0) {
+            mvals[nStencil*lidx + 0] = 1.0; // bvals[lidx] already 0.0 by default-init, same as above
+            return;
+         }
+
          const auto& m = mu[lid];
          double* mv = &mvals[nStencil*lidx];
 
@@ -782,17 +1019,6 @@ void ap_GaussLawCorrection(
    HYPRE_IJVectorDestroy(bij);
    HYPRE_IJVectorDestroy(xij);
 
-   // Belt-and-suspenders: subtract mean(phi) from the solution too
-   {
-      double sumPhi_local = 0.0;
-      for (long long c = 0; c < nlocal; ++c) { sumPhi_local += phiLocal[c]; }
-      double sumPhi_global = 0.0;
-      MPI_Allreduce(&sumPhi_local, &sumPhi_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-      const double totalPoints = (double)globalSize[0] * (double)globalSize[1] * (double)globalSize[2];
-      const double meanPhi = sumPhi_global / totalPoints;
-      for (long long c = 0; c < nlocal; ++c) { phiLocal[c] -= meanPhi; }
-   }
-
    // Eq. 41: E~^{k+1} = E^{k+1} - grad(phi). E^{k+theta} is not directly
    // corrected by Eq. 41 -- only E^{k+1} is -- so to stay consistent with
    // Eq. 40 (E^{k+theta} = theta*E^{k+1} + (1-theta)*E^k, with E^k left as
@@ -816,6 +1042,12 @@ void ap_GaussLawCorrection(
          phiprof::initializeTimer("AP: apply Gauss correction to E"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            // Not just DO_NOT_COMPUTE/OUTER_BOUNDARY_PADDING: a genuine boundary
+            // cell's Ekp1 was already finalised by ap_SolveElectricField's own
+            // identity-row dispatch (fieldSolverBoundaryCondElectricField),
+            // before this function was even called. Subtracting a
+            // phi-gradient here would silently overwrite that pinned value.
+            if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
             const size_t lid = stencil.ooo();
             if (stencil.cellExists(1,0,0) && stencil.cellExists(-1,0,0)) {
                Ekp1[lid][0] -= 0.5*(phiGrid[stencil.indexFromOffset(1,0,0)][0]-phiGrid[stencil.indexFromOffset(-1,0,0)][0])/dxyz[0];
@@ -850,6 +1082,7 @@ static void ap_ReportFieldMagnitude(const char* label, std::span<const ApVec3> f
       phiprof::initializeTimer("AP: report field magnitude"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
          const size_t lid = stencil.ooo();
          for (int comp = 0; comp < 3; ++comp) {
             const Real v = field[lid][comp];
@@ -885,6 +1118,15 @@ static void ap_ApplyLowPassFilter1D(std::span<ApVec3> field, int axis, fsgrids::
       phiprof::initializeTimer("AP: low-pass filter, compute"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         // Not just DO_NOT_COMPUTE/OUTER_BOUNDARY_PADDING: this filter was built
+         // and only ever exercised on a fully periodic domain (Weibel), with no boundary
+         // cells to consider. A genuine boundary cell's E/B is already
+         // correctly pinned (0007/0008's own identity-row dispatch and
+         // direct pinning) -- skip computing a filtered value for it at
+         // all, same as skipping it in the write-back pass below, though
+         // its CURRENT (pinned) value is still legitimately read as a
+         // NEIGHBOUR'S input two lines down, same as any other cell's.
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
          const size_t lid = stencil.ooo();
          const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
          const bool minusExists = stencil.cellExists(minusOffset[0], minusOffset[1], minusOffset[2]);
@@ -901,6 +1143,10 @@ static void ap_ApplyLowPassFilter1D(std::span<ApVec3> field, int axis, fsgrids::
       phiprof::initializeTimer("AP: low-pass filter, write back"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         // A genuine boundary cell's own pinned value must not be
+         // overwritten by a filtered blend of itself and its neighbours --
+         // same broadening as the compute pass above.
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
          const size_t lid = stencil.ooo();
          const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
          for (int comp = 0; comp < 3; ++comp) { field[lid][comp] = filtered[lidx][comp]; }
@@ -931,6 +1177,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
                      fsgrids::bgbspan bgb,
                      fsgrids::volspan vol,
                      fsgrids::technicalspan technical, FieldSolverGrid &fsgrid,
+                     SysBoundary& sysBoundaries,
                      creal& dt, cuint subcycles) {
 
    if (subcycles != 1) {
@@ -964,6 +1211,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
          phiprof::initializeTimer("AP: initial half-step Yee arrays"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
             const size_t lid = stencil.ooo();
             perbdt2[lid] = perb[lid];
             edt2[lid]    = e[lid];
@@ -982,7 +1230,8 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    // Step (2b): E^{k+theta} from Eq. (38), E^{k+1} from Eq. (40)
    ApNodeField Etheta(nStorage), Ekp1(nStorage), Btheta(nStorage), Bkp1(nStorage);
    const bool converged = ap_SolveElectricField(state.E.view(), state.B.view(), bgb, mu.view(), Jhat.view(),
-                                                Etheta.view(), Ekp1.view(), technical, fsgrid, c, theta, dt);
+                                                Etheta.view(), Ekp1.view(), technical, fsgrid, sysBoundaries,
+                                                c, theta, dt);
    ap_ReportFieldMagnitude("ap_propagateFields: after raw solve (E^{k+theta})", Etheta.view(), technical, fsgrid);
 
    if (P::apLowPassFilter) {
@@ -991,7 +1240,8 @@ bool ap_propagateFields(fsgrids::perbspan perb,
    }
 
    // Step (2c): B^{k+1} from Eq. (23), B^{k+theta} from Eq. (39)
-   ap_UpdateMagneticField(state.B.view(), Etheta.view(), Bkp1.view(), Btheta.view(), technical, fsgrid, theta, dt);
+   ap_UpdateMagneticField(state.B.view(), Etheta.view(), Bkp1.view(), Btheta.view(), bgb, technical, fsgrid,
+                          sysBoundaries, theta, dt);
 
    // Step (2d): Gauss correction of E^{k+1} only. rho^k is the total charge density
    // at the start of the step, the same speciesRhoQ that defines mu (Eq. 36).
@@ -1002,6 +1252,7 @@ bool ap_propagateFields(fsgrids::perbspan perb,
          phiprof::initializeTimer("AP: total rho^k"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING) { return; }
             const size_t lid = stencil.ooo();
             Real sum = 0.0;
             for (size_t popID = 0; popID < speciesRhoQ.size(); ++popID) {

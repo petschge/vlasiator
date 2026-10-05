@@ -33,6 +33,7 @@
 
 #include "donotcompute.h"
 #include "ionosphere.h"
+#include "conductingwall.h"
 #include "copysphere.h"
 #include "outflow.h"
 #include "setmaxwellian.h"
@@ -80,7 +81,7 @@ void SysBoundary::addParameters() {
    Readparameters::addComposing(
        "boundaries.boundary",
        "List of boundary condition (BC) types to be used. Each boundary condition to be used has to be on a new line "
-       "boundary = YYY. Available options are: Outflow, Ionosphere, Copysphere, Maxwellian.");
+       "boundary = YYY. Available options are: Outflow, Ionosphere, Copysphere, Maxwellian, ConductingWall.");
    Readparameters::add("boundaries.periodic_x", "Set the grid periodicity in x-direction. 'yes'(default)/'no'.", "yes");
    Readparameters::add("boundaries.periodic_y", "Set the grid periodicity in y-direction. 'yes'(default)/'no'.", "yes");
    Readparameters::add("boundaries.periodic_z", "Set the grid periodicity in z-direction. 'yes'(default)/'no'.", "yes");
@@ -91,6 +92,7 @@ void SysBoundary::addParameters() {
    SBC::Copysphere::addParameters();
    SBC::Outflow::addParameters();
    SBC::Maxwellian::addParameters();
+   SBC::ConductingWall::addParameters();
 }
 
 /*!\brief Get this class' parameters.
@@ -227,6 +229,29 @@ void SysBoundary::initSysBoundaries(Project& project, creal& t) {
          }
          if ((faces[4] || faces[5]) && P::zcells_ini < 5) {
             abort_mpi("Maxwellian condition loaded on z- or z+ face but not enough cells in z!");
+         }
+      } else if (*it == "ConductingWall" || *it == "conductingwall") {
+         this->addSysBoundary(::new SBC::ConductingWall, project, t);
+         anyDynamic = anyDynamic | this->getSysBoundary(sysboundarytype::CONDUCTINGWALL)->isDynamic();
+         bool faces[6];
+         this->getSysBoundary(sysboundarytype::CONDUCTINGWALL)->getFaces(&faces[0]);
+         if ((faces[0] || faces[1]) && periodic[0]) {
+            abort_mpi("Conflict: x boundaries set to periodic but found ConductingWall also!");
+         }
+         if ((faces[2] || faces[3]) && periodic[1]) {
+            abort_mpi("Conflict: y boundaries set to periodic but found ConductingWall also!");
+         }
+         if ((faces[4] || faces[5]) && periodic[2]) {
+            abort_mpi("Conflict: z boundaries set to periodic but found ConductingWall also!");
+         }
+         if ((faces[0] || faces[1]) && P::xcells_ini < 5) {
+            abort_mpi("ConductingWall condition loaded on x- or x+ face but not enough cells in x!");
+         }
+         if ((faces[2] || faces[3]) && P::ycells_ini < 5) {
+            abort_mpi("ConductingWall condition loaded on y- or y+ face but not enough cells in y!");
+         }
+         if ((faces[4] || faces[5]) && P::zcells_ini < 5) {
+            abort_mpi("ConductingWall condition loaded on z- or z+ face but not enough cells in z!");
          }
       } else {
          std::ostringstream msg;

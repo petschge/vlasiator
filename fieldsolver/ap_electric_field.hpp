@@ -85,6 +85,7 @@ bool ap_SolveElectricField(
    std::span<std::array<Real,3>> Ekp1,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
+   SysBoundary& sysBoundaries,
    Real c,
    Real theta,
    Real dt
@@ -97,8 +98,10 @@ void ap_UpdateMagneticField(
    std::span<const std::array<Real,3>> Etheta,
    std::span<std::array<Real,3>> Bkp1,
    std::span<std::array<Real,3>> Btheta,
+   fsgrids::constbgbspan bgb,
    fsgrids::technicalspan technical,
    FieldSolverGrid& fsgrid,
+   SysBoundary& sysBoundaries,
    Real theta,
    Real dt
 );
@@ -133,4 +136,5 @@ bool ap_propagateFields(fsgrids::perbspan perb,
                      fsgrids::bgbspan bgb,
                      fsgrids::volspan vol,
                      fsgrids::technicalspan technical, FieldSolverGrid &fsgrid,
+                     SysBoundary& sysBoundaries,
                      creal& dt, cuint subcycles);
