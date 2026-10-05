@@ -1380,7 +1380,10 @@ int simulate(int argn,char* args[]) {
       if (P::propagateVlasovTranslation || P::propagateVlasovAcceleration) {
          phiprof::Timer timer {"Update system boundaries (Vlasov pre-translation)"};
 
-         sysBoundaryContainer.updateState(mpiGrid, technical.view(), fsgrid, perb.view(), bgb.view(), P::t + 0.5 * P::dt);
+         // The AP solver's boundary-driven state (Maxwellian's time-file-driven
+         // Bz, etc.) needs to be evaluated at t + theta*dt when were using the AP solver.
+         const Real sysBoundaryEvalFrac = (P::fieldSolverMethod == "AP") ? P::FieldSolverTheta : 0.5;
+         sysBoundaryContainer.updateState(mpiGrid, technical.view(), fsgrid, perb.view(), bgb.view(), P::t + sysBoundaryEvalFrac * P::dt);
 
          // updateState leaves mpiGrid and fsgrid in mismatching states, interpolated moments need to be recalculated
          // TODO: Check whether updated state is the same as previously so synchronization can be skipped when not needed?
