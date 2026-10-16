@@ -29,6 +29,7 @@
 #include "datareductionoperator.h"
 #include "../object_wrapper.h"
 #include "../fieldsolver/fs_constants.h"
+#include "../fieldsolver/fs_common.h" // divideIfNonZero; ES_FS no longer gets it via ionosphere.h
 
 
 using namespace std;
@@ -697,10 +698,301 @@ namespace DRO {
       return true;
    }
 
-  /********
-	   Next level of helper functions - these include threading and calculate zeroth or first velocity moments or the
-	   diagonal / off-diagonal pressure tensor components for
-	   thermal or non-thermal populations  ********/
+   VariableEntropy::VariableEntropy(cuint _popID): DataReductionOperator(),popID(_popID) {
+      popName = getObjectWrapper().particleSpecies[popID].name;
+   }
+   VariableEntropy::~VariableEntropy() { }
+
+   std::string VariableEntropy::getName() const {return popName + "/vg_entropy";}
+
+   bool VariableEntropy::getDataVectorInfo(std::string& dataType,unsigned int& dataSize,unsigned int& vectorSize) const {
+      dataType = "float";
+      dataSize =  sizeof(Real);
+      vectorSize = 1;
+      return true;
+   }
+
+   bool VariableEntropy::reduceData(const SpatialCell* cell,char* buffer) {
+      #ifdef USE_GPU
+      const vmesh::VelocityBlockContainer* VBC = cell->dev_get_velocity_blocks(popID);
+      #else
+      const vmesh::VelocityBlockContainer* VBC = cell->get_velocity_blocks(popID);
+      #endif
+      // ARCH interface includes OpenMP looping including critical regions for thread summation
+      {
+         Real sum = 0.0;
+
+         if (cell->get_number_of_velocity_blocks(popID) != 0)
+         arch::parallel_reduce<arch::sum>({WID, WID, WID, (uint)cell->get_number_of_velocity_blocks(popID)},
+                                          ARCH_LOOP_LAMBDA(const uint i, const uint j, const uint k, const uint n, Real *lsum ) {
+
+                                             const Realf *block_data = VBC->getData(n);
+                                             const Real *block_parameters = VBC->getParameters(n);
+                                             const Real DV3 = block_parameters[BlockParams::DVX]
+                                                * block_parameters[BlockParams::DVY] * block_parameters[BlockParams::DVZ];
+
+                                             Real inc = 0.0;
+                                             if (block_data[cellIndex(i,j,k)] > 0.) {
+                                                inc = block_data[cellIndex(i,j,k)] * log(block_data[cellIndex(i,j,k)]) * DV3;
+                                             }
+                                             lsum[0] += inc;
+                                          }, sum);
+
+         Entropy = sum;
+      }
+      const char* ptr = reinterpret_cast<const char*>(&Entropy);
+      for (uint i = 0; i < sizeof(Real); ++i) buffer[i] = ptr[i];
+      return true;
+   }
+
+   bool VariableEntropy::setSpatialCell(const SpatialCell* cell) {
+      Entropy = 0.0;
+      return true;
+   }
+
+   /*! \brief Relative Entropy
+    * Calculate for a population the relative entropy similar to the definition by Cassak et al. *2023) as
+    *     sigma_M = integral f log (f/f_M) d3v
+    * where
+    *    f: measured VDF for a population
+    *    f_M: a with the same density n, flow speed U and three component temperature T
+    * Unlike Cassak at al. anisotropy is permitted in f_m and doesn't count as extra entropy
+    * No extra parameters need to be set in cfg file.
+    */
+   VariableRelativeEntropy::VariableRelativeEntropy(cuint _popID): DataReductionOperator(),popID(_popID) {
+      popName = getObjectWrapper().particleSpecies[popID].name;
+      speciesMass = getObjectWrapper().particleSpecies[popID].mass;
+   }
+   VariableRelativeEntropy::~VariableRelativeEntropy() { }
+
+   std::string VariableRelativeEntropy::getName() const {return popName + "/vg_relative_entropy";}
+
+   bool VariableRelativeEntropy::getDataVectorInfo(std::string& dataType,unsigned int& dataSize,unsigned int& vectorSize) const {
+      dataType = "float";
+      dataSize =  sizeof(Real);
+      vectorSize = 1;
+      return true;
+   }
+
+   bool VariableRelativeEntropy::reduceData(const SpatialCell* cell,char* buffer) {
+      #ifdef USE_GPU
+      const vmesh::VelocityBlockContainer* VBC = cell->dev_get_velocity_blocks(popID);
+      #else
+      const vmesh::VelocityBlockContainer* VBC = cell->get_velocity_blocks(popID);
+      #endif
+
+      // First pass we accumulate diagonal terms of the pressure tensor and divide by density to get temperatures
+      const Real HALF = 0.5;
+      {
+         Real sum[3] = {0.0, 0.0, 0.0};
+         Real averageVX = this->averageVX, averageVY = this->averageVY, averageVZ = this->averageVZ;
+
+         if (cell->get_number_of_velocity_blocks(popID) != 0)
+         arch::parallel_reduce<arch::sum>({WID, WID, WID, (uint)cell->get_number_of_velocity_blocks(popID)},
+                                          ARCH_LOOP_LAMBDA(const uint i, const uint j, const uint k, const uint n, Real *lsum ){
+
+                                             const Realf *block_data = VBC->getData(n);
+                                             const Real *block_parameters = VBC->getParameters(n);
+                                             const Real VX = block_parameters[BlockParams::VXCRD] + (i + HALF)*block_parameters[BlockParams::DVX];
+                                             const Real VY = block_parameters[BlockParams::VYCRD] + (j + HALF)*block_parameters[BlockParams::DVY];
+                                             const Real VZ = block_parameters[BlockParams::VZCRD] + (k + HALF)*block_parameters[BlockParams::DVZ];
+                                             const Real DV3 = block_parameters[BlockParams::DVX]
+                                                * block_parameters[BlockParams::DVY] * block_parameters[BlockParams::DVZ];
+
+                                             lsum[0] += block_data[cellIndex(i,j,k)] * (VX - averageVX) * (VX - averageVX) * DV3;
+                                             lsum[1] += block_data[cellIndex(i,j,k)] * (VY - averageVY) * (VY - averageVY) * DV3;
+                                             lsum[2] += block_data[cellIndex(i,j,k)] * (VZ - averageVZ) * (VZ - averageVZ) * DV3;
+                                          }, sum);
+
+         Temperature[0] = sum[0] / density; // this really is k_B T / m
+         Temperature[1] = sum[1] / density;
+         Temperature[2] = sum[2] / density;
+      }
+      // Second pass we compute the relative entropy
+      {
+         Real sum = 0.0;
+         Real density = this->density;
+         Real averageVX = this->averageVX, averageVY = this->averageVY, averageVZ = this->averageVZ;
+         // Device lambdas must not dereference host member arrays
+         // Cassak et al. (2023) use an isotropic scalar T
+         // const Real Tiso = (Temperature[0] + Temperature[1] + Temperature[2]) / 3.0;
+         // const Real Tx = Tiso, Ty = Tiso, Tz = Tiso;
+         const Real Tx = Temperature[0], Ty = Temperature[1], Tz = Temperature[2];
+
+         if (cell->get_number_of_velocity_blocks(popID) != 0)
+         arch::parallel_reduce<arch::sum>({WID, WID, WID, (uint)cell->get_number_of_velocity_blocks(popID)},
+                                          ARCH_LOOP_LAMBDA(const uint i, const uint j, const uint k, const uint n, Real *lsum ) {
+
+                                             const Realf *block_data = VBC->getData(n);
+                                             const Real *block_parameters = VBC->getParameters(n);
+                                             const Real VX = block_parameters[BlockParams::VXCRD] + (i + HALF)*block_parameters[BlockParams::DVX];
+                                             const Real VY = block_parameters[BlockParams::VYCRD] + (j + HALF)*block_parameters[BlockParams::DVY];
+                                             const Real VZ = block_parameters[BlockParams::VZCRD] + (k + HALF)*block_parameters[BlockParams::DVZ];
+                                             const Real DV3 = block_parameters[BlockParams::DVX]
+                                                * block_parameters[BlockParams::DVY] * block_parameters[BlockParams::DVZ];
+
+                                             Real theta_x = (VX-averageVX) * (VX-averageVX) / (2.*Tx);
+                                             Real theta_y = (VY-averageVY) * (VY-averageVY) / (2.*Ty);
+                                             Real theta_z = (VZ-averageVZ) * (VZ-averageVZ) / (2.*Tz);
+                                             Real fM = density *
+                                                       sqrt(1./(2.*M_PI*Tx)) *
+                                                       sqrt(1./(2.*M_PI*Ty)) *
+                                                       sqrt(1./(2.*M_PI*Tz)) *
+                                                       exp(-theta_x - theta_y - theta_z);
+
+                                             Real inc = 0.0;
+                                             if (block_data[cellIndex(i,j,k)] > 0.) {
+                                                inc = block_data[cellIndex(i,j,k)] * log(block_data[cellIndex(i,j,k)]/fM) * DV3;
+                                             }
+                                             lsum[0] += inc;
+                                          }, sum);
+
+         RelativeEntropy = sum;
+      }
+
+      const char* ptr = reinterpret_cast<const char*>(&RelativeEntropy);
+      for (uint i = 0; i < sizeof(Real); ++i) buffer[i] = ptr[i];
+      return true;
+   }
+
+   bool VariableRelativeEntropy::setSpatialCell(const SpatialCell* cell) {
+      // CellParams moments are all-population and time-interpolated; f is at the _V level
+      const spatial_cell::Population& pop = cell->get_population(popID);
+      density   = pop.RHO_V;
+      averageVX = pop.V_V[0];
+      averageVY = pop.V_V[1];
+      averageVZ = pop.V_V[2];
+      for(int i = 0; i < 3; i++) {
+         Temperature[i] = 0.0;
+      }
+      RelativeEntropy = 0.0;
+      return true;
+   }
+
+   /*! \brief Non-Maxwellianess
+    * Calculate for a population the relative entropy per density similar to the definition of Cassak et al. *2023) as
+    *     sigma_M = integral f log (f/f_M) d3v / n
+    * where
+    *    f: measured VDF for a population
+    *    f_M: a Maxwellian with the same density n, flow speed U and three component temperature T
+    * The result allows for an-isotropy in f_M and doesn't count that as non-Maxwellianess
+    * No extra parameters need to be set in cfg file.
+    */
+   VariableNonMaxwellianess::VariableNonMaxwellianess(cuint _popID): DataReductionOperator(),popID(_popID) {
+      popName = getObjectWrapper().particleSpecies[popID].name;
+      speciesMass = getObjectWrapper().particleSpecies[popID].mass;
+   }
+   VariableNonMaxwellianess::~VariableNonMaxwellianess() { }
+
+   std::string VariableNonMaxwellianess::getName() const {return popName + "/vg_nonmaxwellianess";}
+
+   bool VariableNonMaxwellianess::getDataVectorInfo(std::string& dataType,unsigned int& dataSize,unsigned int& vectorSize) const {
+      dataType = "float";
+      dataSize =  sizeof(Real);
+      vectorSize = 1;
+      return true;
+   }
+
+   bool VariableNonMaxwellianess::reduceData(const SpatialCell* cell,char* buffer) {
+      #ifdef USE_GPU
+      const vmesh::VelocityBlockContainer* VBC = cell->dev_get_velocity_blocks(popID);
+      #else
+      const vmesh::VelocityBlockContainer* VBC = cell->get_velocity_blocks(popID);
+      #endif
+
+      // First pass we accumulate diagonal terms of the pressure tensor and divide by density to get temperatures
+      const Real HALF = 0.5;
+      {
+         Real sum[3] = {0.0, 0.0, 0.0};
+         Real averageVX = this->averageVX, averageVY = this->averageVY, averageVZ = this->averageVZ;
+
+         if (cell->get_number_of_velocity_blocks(popID) != 0)
+         arch::parallel_reduce<arch::sum>({WID, WID, WID, (uint)cell->get_number_of_velocity_blocks(popID)},
+                                          ARCH_LOOP_LAMBDA(const uint i, const uint j, const uint k, const uint n, Real *lsum ){
+
+                                             const Realf *block_data = VBC->getData(n);
+                                             const Real *block_parameters = VBC->getParameters(n);
+                                             const Real VX = block_parameters[BlockParams::VXCRD] + (i + HALF)*block_parameters[BlockParams::DVX];
+                                             const Real VY = block_parameters[BlockParams::VYCRD] + (j + HALF)*block_parameters[BlockParams::DVY];
+                                             const Real VZ = block_parameters[BlockParams::VZCRD] + (k + HALF)*block_parameters[BlockParams::DVZ];
+                                             const Real DV3 = block_parameters[BlockParams::DVX]
+                                                * block_parameters[BlockParams::DVY] * block_parameters[BlockParams::DVZ];
+
+                                             lsum[0] += block_data[cellIndex(i,j,k)] * (VX - averageVX) * (VX - averageVX) * DV3;
+                                             lsum[1] += block_data[cellIndex(i,j,k)] * (VY - averageVY) * (VY - averageVY) * DV3;
+                                             lsum[2] += block_data[cellIndex(i,j,k)] * (VZ - averageVZ) * (VZ - averageVZ) * DV3;
+                                          }, sum);
+
+         Temperature[0] = sum[0] / density; // this really is k_B T / m
+         Temperature[1] = sum[1] / density;
+         Temperature[2] = sum[2] / density;
+      }
+      // Second pass we compute the relative entropy
+      {
+         Real sum = 0.0;
+         Real density = this->density;
+         Real averageVX = this->averageVX, averageVY = this->averageVY, averageVZ = this->averageVZ;
+         // Device lambdas must not dereference host member arrays
+         // Cassak et al. (2023) use an isotropic scalar T
+         // const Real Tiso = (Temperature[0] + Temperature[1] + Temperature[2]) / 3.0;
+         // const Real Tx = Tiso, Ty = Tiso, Tz = Tiso;
+         const Real Tx = Temperature[0], Ty = Temperature[1], Tz = Temperature[2];
+
+         if (cell->get_number_of_velocity_blocks(popID) != 0)
+         arch::parallel_reduce<arch::sum>({WID, WID, WID, (uint)cell->get_number_of_velocity_blocks(popID)},
+                                          ARCH_LOOP_LAMBDA(const uint i, const uint j, const uint k, const uint n, Real *lsum ) {
+
+                                             const Realf *block_data = VBC->getData(n);
+                                             const Real *block_parameters = VBC->getParameters(n);
+                                             const Real VX = block_parameters[BlockParams::VXCRD] + (i + HALF)*block_parameters[BlockParams::DVX];
+                                             const Real VY = block_parameters[BlockParams::VYCRD] + (j + HALF)*block_parameters[BlockParams::DVY];
+                                             const Real VZ = block_parameters[BlockParams::VZCRD] + (k + HALF)*block_parameters[BlockParams::DVZ];
+                                             const Real DV3 = block_parameters[BlockParams::DVX]
+                                                * block_parameters[BlockParams::DVY] * block_parameters[BlockParams::DVZ];
+
+                                             Real theta_x = (VX-averageVX) * (VX-averageVX) / (2.*Tx);
+                                             Real theta_y = (VY-averageVY) * (VY-averageVY) / (2.*Ty);
+                                             Real theta_z = (VZ-averageVZ) * (VZ-averageVZ) / (2.*Tz);
+                                             Real fM = density *
+                                                       sqrt(1./(2.*M_PI*Tx)) *
+                                                       sqrt(1./(2.*M_PI*Ty)) *
+                                                       sqrt(1./(2.*M_PI*Tz)) *
+                                                       exp(-theta_x - theta_y - theta_z);
+
+                                             Real inc = 0.0;
+                                             if (block_data[cellIndex(i,j,k)] > 0.) {
+                                                inc = block_data[cellIndex(i,j,k)] * log(block_data[cellIndex(i,j,k)]/fM) * DV3;
+                                             }
+                                             lsum[0] += inc;
+                                          }, sum);
+
+         // Divide out the density to get a dimensionless per particle quantity
+         NonMaxwellianess = divideIfNonZero(sum, density);
+      }
+
+      const char* ptr = reinterpret_cast<const char*>(&NonMaxwellianess);
+      for (uint i = 0; i < sizeof(Real); ++i) buffer[i] = ptr[i];
+      return true;
+   }
+
+   bool VariableNonMaxwellianess::setSpatialCell(const SpatialCell* cell) {
+      // CellParams moments are all-population and time-interpolated; f is at the _V level
+      const spatial_cell::Population& pop = cell->get_population(popID);
+      density   = pop.RHO_V;
+      averageVX = pop.V_V[0];
+      averageVY = pop.V_V[1];
+      averageVZ = pop.V_V[2];
+      for(int i = 0; i < 3; i++) {
+         Temperature[i] = 0.0;
+      }
+      NonMaxwellianess = 0.0;
+      return true;
+   }
+
+   /********
+     Next level of helper functions - these include threading and calculate zeroth or first velocity moments or the
+     diagonal / off-diagonal pressure tensor components for
+     thermal or non-thermal populations  ********/
 
    //Calculates rho thermal or rho non-thermal
    static void rhoNonthermalCalculation( const SpatialCell * cell, const bool calculateNonthermal, cuint popID, Real & rho ) {
@@ -962,9 +1254,9 @@ namespace DRO {
       return;
    }
 
-  /*********
-	     End velocity moment / thermal/non-thermal helper functions
-  *********/
+   /*********
+     End velocity moment / thermal/non-thermal helper functions
+   *********/
 
    // Rho nonthermal:
    VariableRhoNonthermal::VariableRhoNonthermal(cuint _popID): DataReductionOperator(),popID(_popID) {
@@ -1960,19 +2252,15 @@ namespace DRO {
       b_par[1] = BY / norm_par;
       b_par[2] = BZ / norm_par;
 
-      // perpendicular unit vector 1 (bulk velocity perpendicular to b)
-      Real BV0 = sqrt(b_par[0] * V0[0] + b_par[1] * V0[1] + b_par[2] * V0[2]);
-      b_perp1[0] = V0[0] - BV0 * b_par[0];
-      b_perp1[1] = V0[1] - BV0 * b_par[1];
-      b_perp1[2] = V0[2] - BV0 * b_par[2];
-      Real norm_perp1 = sqrt(b_perp1[0] * b_perp1[0] + b_perp1[1] * b_perp1[1] + b_perp1[2] * b_perp1[2]);
-      if (!(norm_perp1 > 0.0)) {
-         // if V0 is aligned with b, take arbitrary perpendicular vector
-         b_perp1[0] = +b_par[1] + b_par[2];
-         b_perp1[1] = +b_par[2] - b_par[0];
-         b_perp1[2] = -b_par[0] - b_par[1];
-         norm_perp1 = sqrt(b_perp1[0] * b_perp1[0] + b_perp1[1] * b_perp1[1] + b_perp1[2] * b_perp1[2]);
-      }
+      // perpendicular unit vector 1
+      // g and T_perp are gyrotropic, so any perpendicular pair works; the least-aligned axis keeps |b x e| >= sqrt(2/3)
+      Real e_axis[3] = {0.0, 0.0, 0.0};
+      const Real abx = fabs(b_par[0]), aby = fabs(b_par[1]), abz = fabs(b_par[2]);
+      e_axis[(abx <= aby && abx <= abz) ? 0 : (aby <= abz ? 1 : 2)] = 1.0;
+      b_perp1[0] = b_par[1] * e_axis[2] - b_par[2] * e_axis[1];
+      b_perp1[1] = b_par[2] * e_axis[0] - b_par[0] * e_axis[2];
+      b_perp1[2] = b_par[0] * e_axis[1] - b_par[1] * e_axis[0];
+      const Real norm_perp1 = sqrt(b_perp1[0] * b_perp1[0] + b_perp1[1] * b_perp1[1] + b_perp1[2] * b_perp1[2]);
       b_perp1[0] /= norm_perp1;
       b_perp1[1] /= norm_perp1;
       b_perp1[2] /= norm_perp1;
