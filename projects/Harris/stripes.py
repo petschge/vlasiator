@@ -3,7 +3,8 @@
 
 Fine structure along y is separated from the large-scale fields with a smooth spectral high-pass
 along y (wavelengths below --lcut), and examined in the lobes of one sheet, 1.5 d_i <= |y - y_sheet|
-<= 6.4 d_i. Per output it reports
+<= 6.4 d_i. The geometry comes from harris_geometry.py; between conducting walls the interior
+rows are evenly reflected at the walls before the FFTs. Per output it reports
   - lobe rms of the fine structure in u_ze, u_ye, u_zi, E_y, E_z, B_z, B_x, n_e and n_i - n_e
   - the dominant wavelength along y, in d_i and in cells, from x-averaged lobe spectra of dE_y
   - an E x B test: correlation and slope of du_ze (and du_zi) against the high-passed E x B drift
@@ -33,6 +34,7 @@ except ImportError:  # older installs
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from harris_geometry import Geometry
 
 LAM0 = 1.138553794e5            # Harris.Scale_size
 DI = 2.0 * LAM0                 # lambda0 = d_i/2 in this setup
@@ -43,7 +45,7 @@ LOBE = (1.5, 6.4)               # |y - y_sheet| range in d_i
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--bulk", default="bulk.*.vlsv")
-ap.add_argument("--sheet", type=int, default=1, choices=(1, 2))
+ap.add_argument("--sheet", type=int, default=1, help="which sheet (1 for the single sheet)")
 ap.add_argument("--x", type=float, default=10.0, help="x [d_i] of the space-time diagrams")
 ap.add_argument("--lcut", type=float, default=0.7, help="high-pass cutoff wavelength [d_i]")
 ap.add_argument("--every", type=int, default=1)
@@ -61,9 +63,14 @@ xmin, ymin, _, xmax, ymax, _ = f0.get_spatial_mesh_extent()
 dx, dy = (xmax - xmin) / nx, (ymax - ymin) / ny
 xc = xmin + (np.arange(nx) + 0.5) * dx
 yc = ymin + (np.arange(ny) + 0.5) * dy
-Lh, ymid = 0.5 * (ymax - ymin), 0.5 * (ymin + ymax)
-ysheet = ymid + (0.5 if args.sheet == 2 else -0.5) * Lh
-flip = -1.0 if args.sheet == 2 else 1.0          # rotation by pi about x maps sheet 2 onto sheet 1
+geo = Geometry(f0, nx, ny)
+print(geo.describe())
+if not 1 <= args.sheet <= len(geo.sheets):
+    sys.exit(f"--sheet must be between 1 and {len(geo.sheets)}")
+ysheet, flip = geo.sheets[args.sheet - 1]
+flip = float(flip)                               # rotation by pi about x maps sheet 2 onto sheet 1
+in_half = np.zeros(ny, bool)
+in_half[geo.rows[args.sheet - 1]] = True
 
 def reader(fn):
     f = pt.vlsvfile.VlsvReader(fn)
@@ -75,7 +82,7 @@ def reader(fn):
 
 off = yc - ysheet
 dist = np.abs(off)
-jmid = np.argmin(np.abs(yc - ymid))
+jmid = geo.lobe_rows[0]
 _, g0 = reader(files[0])
 B0 = abs(g0("vg_b_vol")[jmid, :, 0].mean())
 wci = QE * B0 / MP
@@ -94,7 +101,7 @@ print(f"dy={dy/DI:.3f} d_i; rho_e={rho_e/DI:.3f} d_i (2*pi*rho_e={2*np.pi*rho_e/
 print(f"w_lh={wlh/wci:.2f} w_ci, w_ce={wce/wci:.1f} w_ci, w_pe={wpe/wci:.1f} w_ci "
       f"(output cadence resolves w up to {np.pi/((pt.vlsvfile.VlsvReader(files[1]).read_parameter('time') - f0.read_parameter('time'))*wci) if len(files) > 1 else 0:.1f} w_ci)")
 
-lobe = (dist >= LOBE[0] * DI) & (dist <= LOBE[1] * DI)
+lobe = in_half & (dist >= LOBE[0] * DI) & (dist <= LOBE[1] * DI)
 side = np.where(off * flip > 0, 1, -1)                       # +1: lobe above the sheet (sheet frame)
 seg_up = np.where(lobe & (side > 0))[0]
 seg_dn = np.where(lobe & (side < 0))[0]
@@ -102,20 +109,30 @@ seg_up = seg_up[np.argsort(dist[seg_up])]                    # ordered away from
 seg_dn = seg_dn[np.argsort(dist[seg_dn])]
 nseg = min(len(seg_up), len(seg_dn))
 seg_up, seg_dn = seg_up[:nseg], seg_dn[:nseg]
-half = np.where(dist <= 0.5 * Lh)[0]
-ypap = flip * off[half]
-half = half[np.argsort(ypap)]
-ypap = np.sort(ypap)
+half, ypap = geo.rows[args.sheet - 1], geo.ypap[args.sheet - 1]
 ix = int(np.argmin(np.abs(xc - args.x * DI)))
 
-ky = 2 * np.pi * np.fft.fftfreq(ny, dy)
+# Spectral operations along y: the whole periodic column, or the interior rows evenly reflected
+# at the walls (no jump at the wrap); rows outside the interior are returned as 0.
+Jin = np.arange(geo.j_lo, geo.j_hi + 1)
+nspec = ny if not geo.walls else 2 * len(Jin)
+ky = 2 * np.pi * np.fft.fftfreq(nspec, dy)
 kc = 2 * np.pi / (args.lcut * DI)
 with np.errstate(divide="ignore"):
     H = 1.0 / (1.0 + (kc / np.abs(ky))**8)                   # smooth, so the sheets ring little
 H[0] = 0.0
 
+def yspec(a, mult):
+    if not geo.walls:
+        return np.real(np.fft.ifft(np.fft.fft(a, axis=0) * mult[:, None], axis=0))
+    ai = a[Jin]
+    ext = np.concatenate([ai, ai[::-1]], axis=0)
+    out = np.zeros_like(a, dtype=float)
+    out[Jin] = np.real(np.fft.ifft(np.fft.fft(ext, axis=0) * mult[:, None], axis=0))[:len(Jin)]
+    return out
+
 def hp(a):
-    return np.real(np.fft.ifft(np.fft.fft(a, axis=0) * H[:, None], axis=0))
+    return yspec(a, H)
 
 def corr_slope(a, b):
     a, b = a[lobe].ravel(), b[lobe].ravel()
@@ -138,7 +155,7 @@ for fn in files:
     uEz = (E[..., 0] * B[..., 1] - E[..., 1] * B[..., 0]) / b2
     # spectral d/dy: a centred difference would understate short waves by sin(k dy)/(k dy)
     divE = ((np.roll(E[..., 0], -1, 1) - np.roll(E[..., 0], 1, 1)) / (2 * dx)
-            + np.real(np.fft.ifft(1j * ky[:, None] * np.fft.fft(E[..., 1], axis=0), axis=0)))
+            + yspec(E[..., 1], 1j * ky))
     fields = {"u_ze": flip * ue[..., 2], "u_ye": flip * ue[..., 1], "u_zi": flip * ui[..., 2],
               "E_y": flip * E[..., 1], "E_z": flip * E[..., 2], "B_z": flip * B[..., 2],
               "B_x": B[..., 0], "n_e": ne, "n_i-n_e": ni - ne}

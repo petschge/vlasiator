@@ -542,14 +542,15 @@ namespace projects {
                   cell[fsgrids::bfield::PERBX] += -PHI0_l * (M_PI / Ly_l) * cos(M_PI * xf / Lx_l) * cos(M_PI * ycD / Ly_l);
                   cell[fsgrids::bfield::PERBY] += -PHI0_l * (M_PI / Lx_l) * sin(M_PI * xcD / Lx_l) * sin(M_PI * yf / Ly_l);
                } else {
-                  const Real xc = xyz[0] + 0.5 * gridSpacing[0] - xmid_l;
-                  const Real yc = xyz[1] + 0.5 * gridSpacing[1] - ymid_l;
-                  const Real cosX = cos(M_PI * xc / Lx_l);
-                  const Real sinX = sin(M_PI * xc / Lx_l);
-                  const Real cosY = cos(M_PI * yc / (2.0 * Ly_l));
-                  const Real sinY = sin(M_PI * yc / (2.0 * Ly_l));
-                  cell[fsgrids::bfield::PERBX] += -PHI0_l * (M_PI / (2.0 * Ly_l)) * cosX * sinY;
-                  cell[fsgrids::bfield::PERBY] +=  PHI0_l * (M_PI / Lx_l) * sinX * cosY;
+                  // phi = phi0*cos(pi*X/Lx)*cos(pi*Y/(2*Ly)) (Sec. 5.4), Ly the domain's y half-extent, so
+                  // By vanishes at the domain edge -- with conducting walls that is beyond their boundary
+                  // layers, not on the walls. Bx on its x-face and By on its y-face, as for the double sheet.
+                  const Real xf  = xyz[0] - xmid_l;
+                  const Real yf  = xyz[1] - ymid_l;
+                  const Real xcD = xf + 0.5 * gridSpacing[0];
+                  const Real ycD = yf + 0.5 * gridSpacing[1];
+                  cell[fsgrids::bfield::PERBX] += -PHI0_l * (M_PI / (2.0 * Ly_l)) * cos(M_PI * xf / Lx_l) * sin(M_PI * ycD / (2.0 * Ly_l));
+                  cell[fsgrids::bfield::PERBY] +=  PHI0_l * (M_PI / Lx_l) * sin(M_PI * xcD / Lx_l) * cos(M_PI * yf / (2.0 * Ly_l));
                }
             }
 

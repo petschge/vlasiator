@@ -20,8 +20,10 @@ absorbed by f_M; anisotropy along B at an angle to the axes, agyrotropy, beams a
 tails are not. Small negative values come from velocity discretisation and sparsity truncation.
 
 One sheet is shown in the paper's frame: x in [-Lx, Lx], y in [-6.4, 6.4] d_i around the sheet.
-Sheet 2 is mapped onto sheet 1's orientation through the setup's symmetry (rotation by pi about x:
-y -> -y, (V_x, V_y, V_z) -> (V_x, -V_y, -V_z)), so either sheet compares directly with the paper.
+The geometry (periodic double sheet, or one sheet between conducting walls) is found from the
+first output by harris_geometry.py; only interior rows are plotted. A sheet of the opposite
+polarity (the double sheet's sheet 2) is mapped onto the paper's orientation through the setup's
+symmetry (rotation by pi about x: y -> -y, (V_x, V_y, V_z) -> (V_x, -V_y, -V_z)).
 
 Usage: python3 gem_figures.py [--bulk "bulk.*.vlsv"] [--vdf "distributions.*.vlsv"] [--sheet 1|2]
                               [--t9 16] [--t10 16 20] [--t11 16 20] [--t12 T1 T2] [--t13 T1 T2]
@@ -43,6 +45,7 @@ except ImportError:  # older installs
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from harris_geometry import Geometry
 
 LAM0 = 1.138553794e5            # Harris.Scale_size
 DI = 2.0 * LAM0                 # lambda0 = d_i/2 in this setup
@@ -53,7 +56,7 @@ MU0 = 4e-7 * np.pi
 ap = argparse.ArgumentParser()
 ap.add_argument("--bulk", default="bulk.*.vlsv")
 ap.add_argument("--vdf", default="distributions.*.vlsv")
-ap.add_argument("--sheet", type=int, default=1, choices=(1, 2))
+ap.add_argument("--sheet", type=int, default=1, help="which sheet (1 for the single sheet)")
 ap.add_argument("--t9", type=float, default=16.0)
 ap.add_argument("--t10", type=float, nargs=2, default=(16.0, 20.0))
 ap.add_argument("--t11", type=float, nargs=2, default=(16.0, 20.0))
@@ -77,9 +80,12 @@ if nx < 2:
     sys.exit("1D run: nothing to plot")
 xmin, ymin, _, xmax, ymax, _ = f0.get_spatial_mesh_extent()
 dx, dy = (xmax - xmin) / nx, (ymax - ymin) / ny
-Lh, ymid = 0.5 * (ymax - ymin), 0.5 * (ymin + ymax)
-ysheet = ymid + (0.5 if args.sheet == 2 else -0.5) * Lh
-flip = -1.0 if args.sheet == 2 else 1.0     # sign applied to y and to the y, z components
+geo = Geometry(f0, nx, ny)
+print(geo.describe())
+if not 1 <= args.sheet <= len(geo.sheets):
+    sys.exit(f"--sheet must be between 1 and {len(geo.sheets)}")
+ysheet, flip = geo.sheets[args.sheet - 1]
+flip = float(flip)                          # sign applied to y and to the y, z components
 
 def grid(f, name):
     order = np.argsort(f.read_variable("CellID"))       # file order is per-rank
@@ -88,7 +94,7 @@ def grid(f, name):
 
 yc = ymin + (np.arange(ny) + 0.5) * dy
 xc = xmin + (np.arange(nx) + 0.5) * dx
-jmid = np.argmin(np.abs(yc - ymid))                     # a lobe row between the sheets
+jmid = geo.lobe_rows[0]                                 # a lobe row (between sheets / next to a wall)
 B = grid(f0, "vg_b_vol")
 B0 = abs(B[jmid, :, 0].mean())                          # x-mean removes the perturbation's dBx
 wci = QE * B0 / MP
@@ -100,12 +106,10 @@ vte = np.sqrt(Pe_l / ne_l / ME)
 print(f"B0={B0:.4e} T, 1/w_ci={1/wci:.4e} s, v_A={vA:.4e} m/s, v_te={vte:.4e} m/s "
       f"(v_te/v_A={vte/vA:.3f}; GEM: {np.sqrt(25/12):.3f})")
 
-# rows of the chosen sheet's half-domain, mapped to the paper's y in [-Ly/2, Ly/2]
-half = np.abs(yc - ysheet) <= 0.5 * Lh
-rows = np.where(half)[0]
-ypap = flip * (yc[rows] - ysheet)
-rorder = np.argsort(ypap)
-rows, ypap = rows[rorder], ypap[rorder]
+# interior rows of the chosen sheet's half-domain, mapped to the paper's y in [-Ly/2, Ly/2]
+rows, ypap = geo.rows[args.sheet - 1], geo.ypap[args.sheet - 1]
+in_half = np.zeros(ny, bool)
+in_half[rows] = True
 
 _times = {}
 def time_of(fn):
@@ -119,14 +123,8 @@ def nearest(files, t):
     return fn, time_of(fn)
 
 def flux_function(Bx, By):
-    # Bx = dA/dy, By = -dA/dx on the periodic domain; the k=0 part is a constant
-    kx = 2 * np.pi * np.fft.fftfreq(nx, dx)[None, :]
-    ky = 2 * np.pi * np.fft.fftfreq(ny, dy)[:, None]
-    k2 = kx**2 + ky**2
-    k2[0, 0] = 1.0
-    Ah = -1j * (ky * np.fft.fft2(Bx) - kx * np.fft.fft2(By)) / k2
-    Ah[0, 0] = 0.0
-    return np.real(np.fft.ifft2(Ah))
+    # Bx = dA/dy, By = -dA/dx by line integration over the interior rows (no periodicity in y needed)
+    return geo.flux_function(Bx, By)
 
 jc = np.argsort(np.abs(yc - ysheet))[:2]            # the two rows straddling the sheet centre
 jl = int(np.argmin(np.abs(yc - (ysheet + 3.0 * DI))))  # a lobe row
@@ -351,13 +349,13 @@ for k, (t, lab) in enumerate(zip(args.t13 if args.t13 is not None else args.t11,
         bpc = np.atleast_1d(f.read(mesh="SpatialGrid", tag="BLOCKSPERCELL"))
     cw = cw[bpc > 0].astype(np.int64)
     ii, jj = (cw - 1) % nx, (cw - 1) // nx
-    keep = np.abs(yc[jj] - ysheet) <= 0.5 * Lh          # the chosen sheet's half of the domain
+    keep = in_half[jj]                                  # the chosen sheet's half of the domain
     cw, ii, jj = cw[keep], ii[keep], jj[keep]
     best = int(np.argmax(M[jj, ii]))
     cid, ib, jb = int(cw[best]), ii[best], jj[best]
     xX = xline(flux_function(*np.moveaxis(grid(fb, "vg_b_vol")[..., :2], -1, 0)))[0]
     wrapx = lambda d: (d + (xmax - xmin) / 2) % (xmax - xmin) - (xmax - xmin) / 2
-    Mh = np.where((np.abs(yc - ysheet) <= 0.5 * Lh)[:, None], M, -np.inf)
+    Mh = np.where(in_half[:, None], M, -np.inf)
     jg, ig = np.unravel_index(np.argmax(Mh), M.shape)
     print(f"    largest sigma/n with a stored VDF: {M[jb, ib]:.3e} in cell {cid} at "
           f"x-x_X={wrapx(xc[ib]-xX)/DI:+.2f} d_i, y={flip*(yc[jb]-ysheet)/DI:+.2f} d_i")

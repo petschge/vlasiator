@@ -82,6 +82,7 @@ namespace projects {
       int CURRENT_LOADING; /*!< 0: analytic drifts; 1: drifts scaled so the loaded current equals the AP
                                  solver's discrete curl(B)/mu0; 2: also the in-sheet share of the
                                  perturbation's current (doubleSheet) -- see getPopulationsAt(). */
+      Real WALL_HALF_HEIGHT; /*!< single sheet: sheet-to-wall distance used by the perturbation; 0 = domain half-height */
       Real SEED_AMPLITUDE; /*!< symmetry-breaking seed, relative to PERT_AMPLITUDE -- see setProjectBField() */
       Real SEED_WIDTH;     /*!< its Gaussian width, m */
       Real SHEET_CURRENT;  /*!< sum over species of q*DENSITY*DRIFT_V (A/m^2) */

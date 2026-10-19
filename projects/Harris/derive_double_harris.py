@@ -36,6 +36,17 @@ Harris.doubleSheet flag differ from derive_gem.py; search for "DOUBLE-SHEET"
 below for every place this script actually departs from it.
 
 ----------------------------------------------------------------------------
+GEOMETRY
+----------------------------------------------------------------------------
+"double" (default): the two-sheet, fully periodic box described above.
+"single": the paper's own geometry, one sheet at y=0 between conducting walls at
+y=+-6.4 lambda_i, periodic in x -- half the cells. Vlasiator makes the two outermost
+cell rows at each y face the wall's boundary layers, so the domain is 2 rows taller
+at each end and the walls sit at the interior faces. Harris.cpp takes the
+perturbation's Ly from the domain, so its By vanishes at the domain edge, 2 rows
+beyond each wall, rather than on the walls.
+
+----------------------------------------------------------------------------
 SCALE CHOICE (n0, v_a)
 ----------------------------------------------------------------------------
 The paper's setup is dimensionless (lambda_i, 1/w_ci, v_a, B0, m_i, n0) with
@@ -109,7 +120,9 @@ CURRENT_LOADING = 1
 SYMMETRY_SEED = 0.01
 SEED_WIDTH_LAMBDA0 = 2.0   # Gaussian width in Scale_size units (2 = 1 d_i)
 
-# Cells across the 25.6 lambda_i double-sheet height (and width in 2d). 256 gives
+GEOMETRY = "double"     # "double": two sheets, periodic; "single": one sheet, conducting walls
+# Cells per 25.6 lambda_i (the double-sheet height, and the width in 2d); the single sheet's
+# 12.8 lambda_i interior gets NY/2 rows plus the walls' boundary layers. 256 gives
 # lambda0/dy = 5; core erosion and core drift loss were first order in dy.
 NY = 256
 DT_TCI = 0.005          # dt in 1/w_ci; per-sub-step translation CFL < 1 is checked below
@@ -124,6 +137,14 @@ VDF_EVERY_TCI_2D = 4.0  # MODE="2d": all-cell VDF files would be ~18 GB each at 
 # Every VDF_STRIDE_2D-th CellID; for Nx a multiple of 16 that is every 16th column,
 # including the columns beside x = 0 (X-line) and beside the seam (O-line).
 VDF_STRIDE_2D = 16
+# MODE="2d": also write the VDF of every cell in the rows just above each sheet centre (and
+# the domain's first row), so the X-line VDF is available wherever the X-line goes.
+VDF_SHEET_LINES = True
+# bailout.velocity_space_wall_block_margin. 1 stops the run when a VDF reaches the last velocity
+# block; 0 lets the edge act instead: content pushed past +v is dropped, past -v it is piled
+# into the edge cell (cpu_acc_map.cpp), so prefer it only where the +v edge is the one reached.
+WALL_BLOCK_MARGIN = 1
+RESTART_WALLTIME = 0.0  # io.restart_walltime_interval in s of walltime; 0 = no restart files
 CFG_TAG = ""            # appended to the cfg file name
 # ==============================================================================
 
@@ -184,14 +205,27 @@ vdi = -2.0 * K_B * Ti / (qi * B0 * lam0)
 vde = -2.0 * K_B * Te / (qe * B0 * lam0)
 
 # ----- Domain / grid -----
-# Ly is the y half-extent; sheets at y=+-Ly/2 sit 6.4 lambda_i from the symmetry planes,
-# the paper's sheet-to-wall distance. Square cells (Vlasiator requires dx = dy).
+# Square cells (Vlasiator requires dx = dy), dy = 25.6 lambda_i / NY in both geometries.
+# double: Ly is the y half-extent; sheets at y=+-Ly/2 sit 6.4 lambda_i from the symmetry
+# planes, the paper's sheet-to-wall distance. single: walls at y=+-6.4 lambda_i, and the
+# domain extends NG boundary-layer rows beyond each (determineFace() uses 2).
+assert GEOMETRY in ("double", "single"), 'GEOMETRY must be "double" or "single"'
+assert NY % 4 == 0, "NY must be a multiple of 4"
+NG = 2
 Lx = 12.8 * lam_i
-Ly = 12.8 * lam_i
-Ny = NY
-dy = 2 * Ly / Ny
+dy = 25.6 * lam_i / NY
 dx = dy
+if GEOMETRY == "double":
+    Ly, Ny, Ly_wall = 12.8 * lam_i, NY, 0.0
+    SHEETS = [(-6.4 * lam_i, +1), (+6.4 * lam_i, -1)]       # (centre, drift sign) as in Harris.cpp
+else:
+    Ly_wall = 6.4 * lam_i
+    Ny = NY // 2 + 2 * NG
+    Ly = Ly_wall + NG * dy
+    SHEETS = [(0.0, +1)]
 assert MODE in ("1d", "2d")
+assert not (GEOMETRY == "single" and CURRENT_LOADING == 2), "CURRENT_LOADING=2 is double-sheet only"
+assert WALL_BLOCK_MARGIN in (0, 1), "WALL_BLOCK_MARGIN must be 0 or 1"
 assert CURRENT_LOADING in (0, 1, 2), "CURRENT_LOADING must be 0, 1 or 2"
 Nx = X_CELLS_1D if MODE == "1d" else int(round(2 * Lx / dx))
 Lx_run = 0.5 * Nx * dx                    # x half-extent actually written
@@ -202,7 +236,7 @@ t_max = T_MAX_TCI * tci
 nb   = 0.2 * n0                  # background density
 phi0 = 0.1 * B0 * lam_i           # island perturbation amplitude
 phi0_run = phi0 if MODE == "2d" else 0.0
-CFG_NAME = f"double_harris_{MODE}{'_frozen' if FROZEN_FIELDS else ''}{CFG_TAG}.cfg"
+CFG_NAME = f"{GEOMETRY}_harris_{MODE}{'_frozen' if FROZEN_FIELDS else ''}{CFG_TAG}.cfg"
 
 # ----- Velocity-space extents and block counts -----
 ve_max = ELECTRON_VMAX_MULTIPLE * vte
@@ -249,9 +283,8 @@ def block_sparsity_check(label, mass, T, vts, vd, minValue, v_max, nblk):
     min_edge, max_kept, empty_rows, lost, nkept = nblk, 0, 0, [], []
     for j in range(Ny):
         y = -Ly + (j + 0.5) * dy
-        n1 = n0 / math.cosh((y + 0.5 * Ly) / lam0)**2   # sheet 1, drift +vd (Harris.cpp)
-        n2 = n0 / math.cosh((y - 0.5 * Ly) / lam0)**2   # sheet 2, drift -vd
-        h = [n1 * g(u - vd) + n2 * g(u + vd) + nb * g(u) for u in v]
+        ns = [(n0 / math.cosh((y - yk) / lam0)**2, sk) for yk, sk in SHEETS]
+        h = [sum(nk * g(u - sk * vd) for nk, sk in ns) + nb * g(u) for u in v]
         hmax = [max(h[b*WID:(b+1)*WID]) for b in range(nblk)]
         hsum = [sum(h[b*WID:(b+1)*WID]) for b in range(nblk)]
         content = [(a, b, c) for a in range(nblk) for b in range(nblk) for c in range(nblk)
@@ -266,7 +299,7 @@ def block_sparsity_check(label, mass, T, vts, vd, minValue, v_max, nblk):
         min_edge = min(min_edge, min(min(i, nblk - 1 - i) for blk in kept for i in blk))
         max_kept = max(max_kept, len(kept)); nkept.append(len(kept))
         retained = pref * dv**3 * sum(gsum[a] * gsum[b] * hsum[c] for (a, b, c) in kept)
-        lost.append(1.0 - retained / (n1 + n2 + nb))
+        lost.append(1.0 - retained / (sum(nk for nk, _ in ns) + nb))
     spare = min_edge - WALL_MARGIN_BLOCKS
     status = "PASS" if (spare >= 1 and empty_rows == 0) else "FAIL"
     print(f"  {label}: {nblk} blocks/dim, dv={dv/vts:.3f} v_ts, block={WID*dv/vts:.2f} v_ts, "
@@ -309,7 +342,8 @@ print(f"n0        = {n0:.6e} m^-3      nb        = {nb:.6e} m^-3")
 print()
 print("================ Domain / grid =================================")
 print(f"MODE={MODE}, FROZEN_FIELDS={FROZEN_FIELDS}: x half-extent {Lx_run:.6e} m (Nx={Nx}, dx={dx:.6e} m)")
-print(f"Ly = {Ly:.6e} m  (Ny={Ny}, dy={dy:.6e} m)")
+print(f"GEOMETRY={GEOMETRY}: Ly = {Ly:.6e} m  (Ny={Ny}, dy={dy:.6e} m)"
+      + (f"; walls at y=+-{Ly_wall:.6e} m, {NG} boundary rows beyond each" if GEOMETRY == "single" else ""))
 print(f"dt = {dt:.6e} s   t_max = {t_max:.6e} s   ({t_max/dt:.0f} steps)")
 # AP translation runs as theta*dt then (1-theta)*dt; Vlasiator's translation moves mass at
 # most one cell per call (cpu_trans_map_amr.cpp), so each sub-step needs CFL < 1.
@@ -350,13 +384,22 @@ if abs(dx / lam_i - 0.2) > 1e-9:
     deviations.append(f"dx=dy={dx/lam_i:g} lambda_i instead of 0.2")
 if (abs(dv_i / vti - PAPER_DV_ION) > 1e-3) or (abs(dv_e / vte - PAPER_DV_ELECTRON) > 1e-3):
     deviations.append(f"dv={dv_i/vti:.3f}v_ti and {dv_e/vte:.3f}v_te instead of {PAPER_DV_ION:.3f} and {PAPER_DV_ELECTRON:.3f}")
-if THETA != 0.5:
-    deviations.append(f"theta={THETA:g} instead of 1/2")
+if GEOMETRY == "double":
+    deviations.append("two opposite-polarity sheets in a fully periodic box instead of one sheet "
+                      "between conducting walls")
+deviations.append(f"theta={THETA:g} (the paper does not state its value for Sec. 5.4)")
 if LOW_PASS_FILTER:
     deviations.append("lowPassFilter=1, which is not in the paper")
 stage = ("1D x-invariant equilibrium test, no perturbation, " + ("fields FROZEN (B fixed, E=0)" if FROZEN_FIELDS else "AP field solve on")
          if MODE == "1d" else "2D GEM run" + (", fields FROZEN" if FROZEN_FIELDS else ""))
 override_note = ("# Overrides: " + " ".join(OVERRIDES) + "\n") if OVERRIDES else ""
+geometry_note = ("# DOUBLE Harris-sheet variant of the GEM reconnection challenge (Liu, Cai, Cao &\n"
+                 "# Lapenta 2025, JCP 528:113840, Section 5.4), fully periodic." if GEOMETRY == "double" else
+                 "# GEM reconnection challenge as in Liu, Cai, Cao & Lapenta 2025, JCP 528:113840,\n"
+                 "# Section 5.4: one Harris sheet between conducting walls, periodic in x.")
+geometry_note += "\n# See derive_double_harris.py's module docstring."
+requires_extra = ("; harris-single-sheet.patch for the face-evaluated single-sheet perturbation"
+                  if GEOMETRY == "single" else "")
 stage_note = textwrap.fill(f"Stage: {stage}; {Nx} x {Ny} cells, t_max = {T_MAX_TCI:g}/w_ci "
                            f"({t_max/dt:.0f} steps).", width=80, initial_indent="# ", subsequent_indent="# ")
 deviation_note = textwrap.fill(
@@ -366,38 +409,66 @@ deviation_note = textwrap.fill(
 
 seed_lines = (f"symmetrySeed = {SYMMETRY_SEED:g}\nsymmetrySeedWidth = {SEED_WIDTH_LAMBDA0:g}\n"
               if MODE == "2d" else "")
+if GEOMETRY == "double":
+    boundary_block = """[boundaries]
+periodic_x = yes
+periodic_y = yes
+periodic_z = yes
+# No "boundary = ..." line: fully periodic in all three dimensions, so there
+# is no open/wall face anywhere for a boundary condition to apply to.
+"""
+else:
+    boundary_block = f"""[boundaries]
+periodic_x = yes
+periodic_y = no
+periodic_z = yes
+boundary = ConductingWall
+# The {NG} outermost rows at each y face are the walls' boundary layers; the walls sit
+# between them and the interior, at y = +-{Ly_wall:.9e} m (+-6.4 lambda_i).
 
-def io_class(name, every_tci, stride):
+[proton_conductingwall]
+face = y+
+face = y-
+
+[electron_conductingwall]
+face = y+
+face = y-
+"""
+# rows just above each sheet centre: NY/4, 3NY/4 (double) or Ny/2 (single); row 0 comes along
+YLINE = NY // 4 if GEOMETRY == "double" else Ny // 2
+line_rows = len(range(0, Ny, YLINE)) if (MODE == "2d" and VDF_SHEET_LINES) else 0
+
+def io_class(name, every_tci, stride, lines=False):
     steps = max(1, int(round(every_tci * tci / dt)))
+    xl, yl, zl = (1, YLINE, 1) if lines else (0, 0, 0)
     return (f"system_write_t_interval = {steps*dt*(1-1e-9):.9e}\n"
             f"system_write_file_name = {name}\n"
             f"system_write_distribution_stride = {stride}\n"
-            "system_write_distribution_xline_stride = 0\n"
-            "system_write_distribution_yline_stride = 0\n"
-            "system_write_distribution_zline_stride = 0\n")
+            f"system_write_distribution_xline_stride = {xl}\n"
+            f"system_write_distribution_yline_stride = {yl}\n"
+            f"system_write_distribution_zline_stride = {zl}\n")
 io_classes = io_class("bulk", BULK_EVERY_TCI, 0)
 vdf_every = VDF_EVERY_TCI if MODE == "1d" else VDF_EVERY_TCI_2D
 vdf_stride = 1 if MODE == "1d" else VDF_STRIDE_2D
 if vdf_every > 0:
-    io_classes += "# VDFs for wall_scan.py\n" + io_class("distributions", vdf_every, vdf_stride)
+    io_classes += ("# VDFs: every " + f"{vdf_stride}" + "th cell" + (", plus every cell of rows "
+                   + ", ".join(str(r) for r in range(0, Ny, YLINE)) if line_rows else "") + "\n"
+                   + io_class("distributions", vdf_every, vdf_stride, lines=line_rows > 0))
+if RESTART_WALLTIME > 0:
+    io_classes += f"restart_walltime_interval = {RESTART_WALLTIME:g}\n"
 
 # =============================== Write the cfg ===============================
 cfg = f"""\
-# DOUBLE Harris-sheet variant of the GEM reconnection challenge (Liu, Cai, Cao &
-# Lapenta 2025, JCP 528:113840, Section 5.4), fully periodic. See
-# derive_double_harris.py's module docstring and the Harris.cpp patch.
+{geometry_note}
 #
 {stage_note}
 {override_note}#
-# Requires: AP solver patches (ES_FS branch, on top of dd574e33); gem/0002
-# through gem/0005 (NOT gem/0001-conducting-wall.patch); then, in order,
-# harris-single-island.patch, harris-current-loading.patch and (2D cfgs)
-# harris-symmetry-seed.patch.
+# Requires: petschge/vlasiator ca0a894 or later{requires_extra}.
 #
 # Generated by derive_double_harris.py -- DO NOT hand-edit the derived
 # numbers below; edit the free choices (n0, v_a, *_VMAX_MULTIPLE, DV_*,
 # SPARSITY_REL_BACKGROUND, THETA, LOW_PASS_FILTER, CURRENT_LOADING, SYMMETRY_SEED,
-# SEED_WIDTH_LAMBDA0, NY, DT_TCI, MODE,
+# SEED_WIDTH_LAMBDA0, GEOMETRY, NY, DT_TCI, MODE, VDF_SHEET_LINES, WALL_BLOCK_MARGIN,
 # X_CELLS_1D, FROZEN_FIELDS, T_MAX_TCI, *_EVERY_TCI) at the top of that script
 # and rerun instead, so this file and its derivation stay in sync.
 #
@@ -443,15 +514,9 @@ t_max = {t_max:.9e}
 
 [bailout]
 min_dt = {dt*1e-3:.3e}
-velocity_space_wall_block_margin = 1
+velocity_space_wall_block_margin = {WALL_BLOCK_MARGIN}
 
-[boundaries]
-periodic_x = yes
-periodic_y = yes
-periodic_z = yes
-# No "boundary = ..." line: fully periodic in all three dimensions, so there
-# is no open/wall face anywhere for a boundary condition to apply to.
-
+{boundary_block}
 [fieldsolver]
 method = AP
 theta = {THETA:g}
@@ -464,7 +529,7 @@ BX0 = {B0:.9e}
 BY0 = 0.0
 BZ0 = 0.0
 perturbationAmplitude = {phi0_run:.9e}
-doubleSheet = 1
+doubleSheet = {1 if GEOMETRY == "double" else 0}
 currentLoading = {CURRENT_LOADING}
 {seed_lines}
 [proton_Harris]
@@ -533,6 +598,8 @@ output = fg_b
 output = vg_e_vol
 output = vg_b_vol
 
+output = populations_vg_nonmaxwellianess
+
 output = vg_rank
 output = vg_boundarytype
 diagnostic = populations_vg_blocks
@@ -545,8 +612,8 @@ print(f"Wrote {CFG_NAME}")
 # ~260 B per velocity block, measured from the 128^2 2D pilot's VDF files (17.29 M blocks,
 # 4.50 GB each); the initial state is written with full VDFs as well.
 _all_gb = Nx * Ny * (mean_e + mean_i) * 260 / 1e9
-_vdf_gb = _all_gb / vdf_stride
+_vdf_gb = _all_gb / vdf_stride + _all_gb * line_rows / Ny
 _nvdf = int(T_MAX_TCI / vdf_every) + 1 if vdf_every > 0 else 0
 _init_gb = _all_gb if MODE == "1d" else 0.0       # write_initial_state is on only in 1d
 print(f"Velocity blocks at t=0: ~{Nx*Ny*(mean_e+mean_i)/1e6:.2f} M. VDF files ~{_vdf_gb:.2f} GB each x {_nvdf}"
-      f" (stride {vdf_stride}), initial state {_init_gb:.2f} GB: ~{_vdf_gb*_nvdf+_init_gb:.1f} GB in total")
+      f" (stride {vdf_stride}{f' + {line_rows} rows' if line_rows else ''}), initial state {_init_gb:.2f} GB: ~{_vdf_gb*_nvdf+_init_gb:.1f} GB in total")
