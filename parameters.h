@@ -146,6 +146,9 @@ struct Parameters {
    static bool lcclOutflowAbsorbing;      /*!< Replace the Outflow boundary's normally-pinned E=0 with the
                                            absorbing 1D, normal-incidence condition Ey=c*Bz, Ez=-c*By.
                                            Not part of Liu et al. 2025; off by default. */
+   static bool lcclInflowCharacteristic; /*!< LCCL solver: incident-wave (characteristic) condition on an x- Maxwellian face. */
+   static uint lcclLowPassFilterOrder;   /*!< LCCL solver: order (even, >= 2) of the Shapiro low-pass filter. */
+   static bool lcclGaussOutflowNeumann;  /*!< LCCL solver: floating phi at faces into Outflow cells in the Gauss correction. */
    static Real resistivity;             /*!< Resistivity in Ohm's law eta*J term. */
    static uint ohmHallTerm; /*!< Enable/choose spatial order of Hall term in Ohm's law JXB term. 0: off, 1: 1st spatial
                                order, 2: 2nd spatial order. */

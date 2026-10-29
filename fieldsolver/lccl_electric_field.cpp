@@ -1,4 +1,5 @@
 #include "lccl_electric_field.hpp"
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -240,6 +241,89 @@ static void lccl_PublishToVol(std::span<const ApVec3> B, std::span<const ApVec3>
 }
 
 /* ============================================================
+ * Section 1b: incident-wave condition on an x- Maxwellian face
+ *             (fieldsolver.inflowCharacteristic)
+ * ============================================================
+ * Imposes the incoming characteristics and takes the outgoing ones from the
+ * interior, instead of pinning B to the template and E to 0:
+ *    incoming  Ey + c Bz = S_y,  Ez - c By = S_z   with S_y = c Bz_tpl, S_z = -c By_tpl
+ *    outgoing  Ey - c Bz,        Ez + c By         constant along x + c t
+ * Pinning E = 0 drives only one of the two sub-lattices of the centred
+ * collocated stencils; this condition sets both consistently.
+ * The template keeps its meaning Bz = Ey_in/c, so the input files are unchanged.
+ * Normal components (Ex, Bx) stay with the boundary condition's own dispatch.
+ */
+namespace {
+struct ApInflowState {
+   ApNodeField Etheta, Ekp1, Btheta, Bkp1;
+   std::vector<char> active;  // per storage cell
+   explicit ApInflowState(size_t n) : Etheta(n), Ekp1(n), Btheta(n), Bkp1(n), active(n, 0) {}
+};
+std::unique_ptr<ApInflowState> lcclInflow;  // reset each step; null when the condition is off
+} // namespace
+
+static void lccl_PrepareInflowCharacteristic(std::span<const ApVec3> Ek, std::span<const ApVec3> Bk,
+                                           fsgrids::perbspan perbYee, fsgrids::constbgbspan bgb,
+                                           fsgrids::technicalspan technical, FieldSolverGrid& fsgrid,
+                                           SysBoundary& sysBoundaries, Real c, Real theta, Real dt) {
+   // bailout() only flags; each failure returns with the condition off so nothing below runs
+   lcclInflow.reset();
+   const auto globalSize = fsgrid.getGlobalSize();
+   if (globalSize[1] != 1 || globalSize[2] != 1) {  // the split below is for an x-normal face
+      bailout(true, "fieldsolver.inflowCharacteristic requires a grid that is 1D in x", __FILE__, __LINE__);
+      return;
+   }
+   const auto dxyz = fsgrid.getGridSpacing();
+   const Real foot = c*theta*dt/dxyz[0];  // where the outgoing characteristic was at t^k, in cells
+   if (foot >= FS_STENCIL_WIDTH) {  // interpolation reads offsets floor(foot) and floor(foot)+1
+      bailout(true, "fieldsolver.inflowCharacteristic: c*theta*dt/dx >= FS_STENCIL_WIDTH", __FILE__, __LINE__);
+      return;
+   }
+   const int o0 = (int)std::floor(foot);
+   const Real f = foot - o0;
+
+   lcclInflow = std::make_unique<ApInflowState>(fsgrid.getNumStorageCells());
+   ApInflowState& st = *lcclInflow;
+   int unsupported_local = 0;
+   fsgrid.serial_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("LCCL: x- incident-wave boundary"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag != sysboundarytype::MAXWELLIAN) { return; }
+         const auto g = coordinates.localToGlobal(stencil.i, stencil.j, stencil.k);
+         // x- face cells are the first two layers (SysBoundaryCondition::determineFace)
+         if (g[0] >= 2 || !stencil.cellExists(o0 + 1, 0, 0)) { unsupported_local = 1; return; }
+         const size_t lid = stencil.ooo();
+         const size_t a = (o0 == 0) ? lid : stencil.indexFromOffset(o0, 0, 0);
+         const size_t b = stencil.indexFromOffset(o0 + 1, 0, 0);
+
+         SBC::SysBoundaryCondition* bc = sysBoundaries.getSysBoundary(sysBoundaryFlag);
+         const Real BtplY = bc->fieldSolverBoundaryCondMagneticField(perbYee, bgb, technical, dxyz, g, stencil, 1);
+         const Real BtplZ = bc->fieldSolverBoundaryCondMagneticField(perbYee, bgb, technical, dxyz, g, stencil, 2);
+         const Real Sy = c*BtplZ, Sz = -c*BtplY;  // template is evaluated at t + theta*dt (vlasiator.cpp)
+
+         const Real wm = (1.0-f)*(Ek[a][1] - c*Bk[a][2]) + f*(Ek[b][1] - c*Bk[b][2]);
+         const Real um = (1.0-f)*(Ek[a][2] + c*Bk[a][1]) + f*(Ek[b][2] + c*Bk[b][1]);
+
+         st.Etheta[lid] = {0.0, 0.5*(Sy + wm), 0.5*(Sz + um)};
+         st.Btheta[lid] = {0.0, 0.5*(um - Sz)/c, 0.5*(Sy - wm)/c};
+         for (int comp = 1; comp < 3; ++comp) {
+            st.Ekp1[lid][comp] = (st.Etheta[lid][comp] - Ek[lid][comp])/theta + Ek[lid][comp];     // Eq. 40
+            st.Bkp1[lid][comp] = (st.Btheta[lid][comp] - (1.0-theta)*Bk[lid][comp])/theta;        // Eq. 39
+         }
+         st.active[lid] = 1;
+      });
+   int unsupported = 0;
+   MPI_Allreduce(&unsupported_local, &unsupported, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+   if (unsupported != 0) {
+      bailout(true, "fieldsolver.inflowCharacteristic supports a Maxwellian boundary on the x- face only",
+              __FILE__, __LINE__);
+      lcclInflow.reset();
+   }
+}
+
+/* ============================================================
  * Section 2: alpha_s / mu / J-hat  (Eqs. 35-37), evaluated at the nodes
  * ============================================================ */
 
@@ -466,6 +550,7 @@ bool lccl_SolveElectricField(
             // this point in lccl_propagateFields): a one-step lag, same
             // spirit as 0008's own direct-pinning lag for Outflow's B.
             const bool useAbsorbing = outflowAbsorbingActive && (sysBoundaryFlag == sysboundarytype::OUTFLOW);
+            const bool useInflow = lcclInflow && lcclInflow->active[lid];
             // bc is needed regardless of useAbsorbing: comp==0 (Ex) always
             // goes through the real dispatch below, even on an Outflow
             // cell with the absorbing condition active for comp 1 and 2.
@@ -477,6 +562,9 @@ bool lccl_SolveElectricField(
                } else if (useAbsorbing && comp == 2) {
                   Etheta[lid][2] = -c * Bk[lid][1];
                   Ekp1[lid][2]   = -c * Bk[lid][1];
+               } else if (useInflow && comp != 0) {
+                  Etheta[lid][comp] = lcclInflow->Etheta[lid][comp];
+                  Ekp1[lid][comp]   = lcclInflow->Ekp1[lid][comp];
                } else {
                   bc->fieldSolverBoundaryCondElectricField(Etheta, stencil, comp);
                   bc->fieldSolverBoundaryCondElectricField(Ekp1, stencil, comp);
@@ -662,7 +750,13 @@ void lccl_UpdateMagneticField(
          const size_t lid = stencil.ooo();
          const auto globalCoordinates = coordinates.localToGlobal(stencil.i, stencil.j, stencil.k);
          SBC::SysBoundaryCondition* bc = sysBoundaries.getSysBoundary(sysBoundaryFlag);
+         const bool useInflow = lcclInflow && lcclInflow->active[lid];
          for (int comp = 0; comp < 3; ++comp) {
+            if (useInflow && comp != 0) {
+               Bkp1[lid][comp]   = lcclInflow->Bkp1[lid][comp];
+               Btheta[lid][comp] = lcclInflow->Btheta[lid][comp];
+               continue;
+            }
             const Real val = bc->fieldSolverBoundaryCondMagneticField(
                Bkp1, bgb, technical, dxyz, globalCoordinates, stencil, comp);
             Bkp1[lid][comp]   = val;
@@ -744,8 +838,10 @@ void lccl_GaussLawCorrection(
    // so technical[] can't just be read directly at a lidx.
    std::vector<double> mvals(nStencil*nlocal, 0.0), bvals(nlocal, 0.0);
    double meanRhoOverEps = 0.0;
+   bool useOutflowNeumann = false;
    double nInteriorGlobal = 0.0;
    bool hasAnchorGlobal = false;  // true if any boundary-flagged (Dirichlet-pinned) cell exists anywhere
+   bool hasPinnedNonOutflow = false;
    {
       // Mean-subtracting rho (and, further down, phi) is NOT part of the
       // paper's Eq. (45) -- it is an addition needed only for a FULLY
@@ -773,6 +869,7 @@ void lccl_GaussLawCorrection(
       // compute+apply the mean-subtraction when none do.
       double sumRho_local = 0.0, nInterior_local = 0.0;
       bool hasAnchor_local = false;
+      bool hasPinnedNonOutflow_local = false;  // a phi = 0 cell that stays coupled when Outflow faces float
       // DIAGNOSTIC (debugging a POS bailout, not part of the fix above):
       // max|rho/eps0| and roughly where it occurs, over NOT_SYSBOUNDARY
       // cells. Rank-local x only (no cross-rank argmax reduction) -- exact
@@ -784,7 +881,13 @@ void lccl_GaussLawCorrection(
          phiprof::initializeTimer("LCCL: compute mean(rho)"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-            if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { hasAnchor_local = true; return; }
+            if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) {
+               hasAnchor_local = true;
+               if (sysBoundaryFlag != sysboundarytype::OUTFLOW
+                   && sysBoundaryFlag != sysboundarytype::DO_NOT_COMPUTE
+                   && sysBoundaryFlag != sysboundarytype::OUTER_BOUNDARY_PADDING) { hasPinnedNonOutflow_local = true; }
+               return;
+            }
             const Real rhoOverEpsHere = rho[stencil.ooo()][0] / physicalconstants::EPS_0;
             sumRho_local += rhoOverEpsHere;
             nInterior_local += 1.0;
@@ -797,7 +900,14 @@ void lccl_GaussLawCorrection(
       MPI_Allreduce(&sumRho_local, &sumRho_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
       MPI_Allreduce(&nInterior_local, &nInteriorGlobal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
       MPI_Allreduce(&hasAnchor_local, &hasAnchorGlobal, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
+      MPI_Allreduce(&hasPinnedNonOutflow_local, &hasPinnedNonOutflow, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
       meanRhoOverEps = hasAnchorGlobal ? 0.0 : (sumRho_global / nInteriorGlobal);
+      // with every pinned cell behind a zero-flux face the system would be singular
+      useOutflowNeumann = P::lcclGaussOutflowNeumann && hasPinnedNonOutflow;
+      if (P::lcclGaussOutflowNeumann && !hasPinnedNonOutflow) {
+         bailout(true, "fieldsolver.gaussLawOutflowNeumann needs a boundary other than Outflow to pin phi",
+                 __FILE__, __LINE__);
+      }
       int myRankForDiag; MPI_Comm_rank(MPI_COMM_WORLD, &myRankForDiag);
       fprintf(stderr, "lcclGaussLawCorrection: rank %d: max|rho/eps0|=%e at x=%e m (hasAnchor=%d, meanRhoOverEps=%e)\n",
               myRankForDiag, (double)maxAbsRhoOverEps_local, (double)xAtMax_local,
@@ -875,9 +985,23 @@ void lccl_GaussLawCorrection(
          const Real czz_zm = 1.0 + dt*dt*mu[lidZm][8]/physicalconstants::EPS_0;
          const Real czz_zp = 1.0 + dt*dt*mu[lidZp][8]/physicalconstants::EPS_0;
 
-         const Real cxx_faceM = 0.5*(cxx_here+cxx_xm), cxx_faceP = 0.5*(cxx_here+cxx_xp);
-         const Real cyy_faceM = 0.5*(cyy_here+cyy_ym), cyy_faceP = 0.5*(cyy_here+cyy_yp);
-         const Real czz_faceM = 0.5*(czz_here+czz_zm), czz_faceP = 0.5*(czz_here+czz_zp);
+         Real cxx_faceM = 0.5*(cxx_here+cxx_xm), cxx_faceP = 0.5*(cxx_here+cxx_xp);
+         Real cyy_faceM = 0.5*(cyy_here+cyy_ym), cyy_faceP = 0.5*(cyy_here+cyy_yp);
+         Real czz_faceM = 0.5*(czz_here+czz_zm), czz_faceP = 0.5*(czz_here+czz_zp);
+         if (useOutflowNeumann) {
+            // no correction flux into an open end: the potential there floats instead of being
+            // pinned to the other wall's, which would return any sheath potential step through
+            // the vacuum gaps as uniform fields
+            const auto outflow = [&](bool exists, size_t n) {
+               return exists && technical[n].sysBoundaryFlag == sysboundarytype::OUTFLOW;
+            };
+            if (outflow(hasXm, lidXm)) { cxx_faceM = 0.0; }
+            if (outflow(hasXp, lidXp)) { cxx_faceP = 0.0; }
+            if (outflow(hasYm, lidYm)) { cyy_faceM = 0.0; }
+            if (outflow(hasYp, lidYp)) { cyy_faceP = 0.0; }
+            if (outflow(hasZm, lidZm)) { czz_faceM = 0.0; }
+            if (outflow(hasZp, lidZp)) { czz_faceP = 0.0; }
+         }
 
          mv[0] = cxx_faceM/(dxyz[0]*dxyz[0]) + cxx_faceP/(dxyz[0]*dxyz[0])
                + cyy_faceM/(dxyz[1]*dxyz[1]) + cyy_faceP/(dxyz[1]*dxyz[1])
@@ -1034,6 +1158,32 @@ void lccl_GaussLawCorrection(
          phiGrid[stencil.ooo()][0] = phiLocal[lidx];
       });
    fsgrid.updateGhostCells(phiGrid.view());
+   if (useOutflowNeumann) {
+      // zero normal gradient: an Outflow cell takes phi of the nearest interior cell, so the
+      // centred gradient at the last interior node sees no step into the boundary
+      fsgrid.serial_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("LCCL: mirror phi into Outflow cells"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            if (sysBoundaryFlag != sysboundarytype::OUTFLOW) { return; }
+            for (int dist = 1; dist <= FS_STENCIL_WIDTH; ++dist) {
+               for (int axis = 0; axis < 3; ++axis) {
+                  for (int sgn = -1; sgn <= 1; sgn += 2) {
+                     std::array<int,3> o{0,0,0};
+                     o[axis] = sgn*dist;
+                     if (!stencil.cellExists(o[0], o[1], o[2])) { continue; }
+                     const size_t n = stencil.indexFromOffset(o[0], o[1], o[2]);
+                     if (technical[n].sysBoundaryFlag == sysboundarytype::NOT_SYSBOUNDARY) {
+                        phiGrid[stencil.ooo()][0] = phiGrid[n][0];
+                        return;
+                     }
+                  }
+               }
+            }
+         });
+      fsgrid.updateGhostCells(phiGrid.view());
+   }
 
    // Eq. 41, only applied if actually converged
    if (pcgRelres <= 1.0) {
@@ -1101,64 +1251,72 @@ static void lccl_ReportFieldMagnitude(const char* label, std::span<const ApVec3>
    }
 }
 
-// Low-pass filter, 3-point binomial with alpha=1/2 (transfer function
-// cos^2(k*dx/2)). Two-pass: every filtered value is computed from the
-// original, then copied back. Not part of the paper; off unless
+// Low-pass filter along one axis: Shapiro (1970) filter of order 2n, transfer
+// 1 - sin^(2n)(k*dx/2). n = 1 is the original 3-point binomial (cos^2(k*dx/2)).
+// Every order removes the cell-to-cell mode that the centred stencils of this
+// collocated scheme cannot see; higher orders leave longer features almost alone
+// (order 8: -6% per application at 4 cells, -0.05% at 8 cells). Boundary cells keep
+// their values but are read as neighbours. Not part of the paper; off unless
 // fieldsolver.lowPassFilter is set.
-static void lccl_ApplyLowPassFilter1D(std::span<ApVec3> field, int axis, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
-   const auto localSize = fsgrid.getLocalSize();
-   const int lx = localSize[0], ly = localSize[1], lz = localSize[2];
-   std::vector<ApVec3> filtered((size_t)lx*ly*lz);
-
+static void lccl_ApplyLowPassFilter1D(std::span<ApVec3> field, int axis, int n, fsgrids::technicalspan technical,
+                                    FieldSolverGrid& fsgrid) {
    std::array<int,3> plusOffset{0,0,0};  plusOffset[axis]  =  1;
    std::array<int,3> minusOffset{0,0,0}; minusOffset[axis] = -1;
 
-   fsgrid.serial_for(
-      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
-      phiprof::initializeTimer("LCCL: low-pass filter, compute"), technical,
-      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
-          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-         // Not just DO_NOT_COMPUTE/OUTER_BOUNDARY_PADDING: this filter was built
-         // and only ever exercised on a fully periodic domain (Weibel), with no boundary
-         // cells to consider. A genuine boundary cell's E/B is already
-         // correctly pinned (0007/0008's own identity-row dispatch and
-         // direct pinning) -- skip computing a filtered value for it at
-         // all, same as skipping it in the write-back pass below, though
-         // its CURRENT (pinned) value is still legitimately read as a
-         // NEIGHBOUR'S input two lines down, same as any other cell's.
-         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
-         const size_t lid = stencil.ooo();
-         const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
-         const bool minusExists = stencil.cellExists(minusOffset[0], minusOffset[1], minusOffset[2]);
-         const bool plusExists  = stencil.cellExists(plusOffset[0],  plusOffset[1],  plusOffset[2]);
-         const size_t minusLid = minusExists ? stencil.indexFromOffset(minusOffset[0], minusOffset[1], minusOffset[2]) : lid;
-         const size_t plusLid  = plusExists  ? stencil.indexFromOffset(plusOffset[0],  plusOffset[1],  plusOffset[2])  : lid;
-         for (int comp = 0; comp < 3; ++comp) {
-            filtered[lidx][comp] = 0.5*field[lid][comp] + 0.25*field[minusLid][comp] + 0.25*field[plusLid][comp];
-         }
-      });
+   // (delta^2)^n of the field, one ghost exchange per pass so the result is rank-layout independent
+   ApNodeField d(field.size()), dd(field.size());
+   std::copy(field.begin(), field.end(), d.view().begin());
+   for (int pass = 0; pass < n; ++pass) {
+      const auto src = d.view();
+      auto dst = dd.view();
+      fsgrid.serial_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("LCCL: low-pass filter, second difference"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            const size_t lid = stencil.ooo();
+            if (sysBoundaryFlag == sysboundarytype::DO_NOT_COMPUTE
+                || sysBoundaryFlag == sysboundarytype::OUTER_BOUNDARY_PADDING
+                || !stencil.cellExists(minusOffset[0], minusOffset[1], minusOffset[2])
+                || !stencil.cellExists(plusOffset[0], plusOffset[1], plusOffset[2])) {
+               dst[lid] = {0.0, 0.0, 0.0};  // no full stencil (domain edge): no correction from here
+               return;
+            }
+            const size_t m = stencil.indexFromOffset(minusOffset[0], minusOffset[1], minusOffset[2]);
+            const size_t p = stencil.indexFromOffset(plusOffset[0], plusOffset[1], plusOffset[2]);
+            for (int comp = 0; comp < 3; ++comp) {
+               dst[lid][comp] = src[p][comp] - 2.0*src[lid][comp] + src[m][comp];
+            }
+         });
+      fsgrid.updateGhostCells(dst);
+      d.swap(dd);
+   }
 
+   const Real coeff = std::pow(-0.25, n);  // u_filtered = u - (-1/4)^n (delta^2)^n u
+   const auto dn = d.view();
    fsgrid.serial_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
-      phiprof::initializeTimer("LCCL: low-pass filter, write back"), technical,
+      phiprof::initializeTimer("LCCL: low-pass filter, apply"), technical,
       [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
           cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-         // A genuine boundary cell's own pinned value must not be
-         // overwritten by a filtered blend of itself and its neighbours --
-         // same broadening as the compute pass above.
+         // boundary values are set by their own conditions
          if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
          const size_t lid = stencil.ooo();
-         const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
-         for (int comp = 0; comp < 3; ++comp) { field[lid][comp] = filtered[lidx][comp]; }
+         for (int comp = 0; comp < 3; ++comp) { field[lid][comp] -= coeff*dn[lid][comp]; }
       });
    fsgrid.updateGhostCells(field);
 }
 
-// Separable filter in all three dimensions
+// Separable filter in all three dimensions, of order fieldsolver.lowPassFilterOrder
 static void lccl_ApplyLowPassFilter3D(std::span<ApVec3> field, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
-   lccl_ApplyLowPassFilter1D(field, 0, technical, fsgrid);
-   lccl_ApplyLowPassFilter1D(field, 1, technical, fsgrid);
-   lccl_ApplyLowPassFilter1D(field, 2, technical, fsgrid);
+   int n = (int)(P::lcclLowPassFilterOrder / 2);
+   if (P::lcclLowPassFilterOrder % 2 != 0 || n < 1) {
+      bailout(true, "fieldsolver.lowPassFilterOrder must be an even number >= 2", __FILE__, __LINE__);
+      n = 1;  // bailout() only flags; finish this step with the original filter
+   }
+   lccl_ApplyLowPassFilter1D(field, 0, n, technical, fsgrid);
+   lccl_ApplyLowPassFilter1D(field, 1, n, technical, fsgrid);
+   lccl_ApplyLowPassFilter1D(field, 2, n, technical, fsgrid);
 }
 
 /* ============================================================
@@ -1226,6 +1384,13 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    fsgrid::FsData<std::array<Real,9>> mu(nStorage);
    ApNodeField Jhat(nStorage);
    lccl_BuildSpeciesTensors(speciesRhoQ, speciesJ, state.B.view(), bgb, technical, fsgrid, theta, dt, mu, Jhat);
+
+   if (P::lcclInflowCharacteristic) {
+      lccl_PrepareInflowCharacteristic(state.E.view(), state.B.view(), perb, bgb, technical, fsgrid,
+                                     sysBoundaries, c, theta, dt);
+   } else {
+      lcclInflow.reset();
+   }
 
    // Step (2b): E^{k+theta} from Eq. (38), E^{k+1} from Eq. (40)
    ApNodeField Etheta(nStorage), Ekp1(nStorage), Btheta(nStorage), Bkp1(nStorage);
