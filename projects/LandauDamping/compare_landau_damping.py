@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-
-Analyze output from the LandauDamping project and reproduce Figure 1 of Liu,
-Cai, Cao & Lapenta 2025 Section 5.1 that shows time evolution of the
-electric-field energy E_Ex = 0.5*integral(Ex^2) dx.
+Compare 1-4 LandauDamping runs with Fig. 1 of Liu, Cai, Cao & Lapenta 2025
+(JCP 528:113840, Sec. 5.1): E_Ex(t) = 0.5*integral(Ex^2) dx.
 
 Usage:
-    python3 compare_landau_damping.py [output_directory]
+    python3 compare_landau_damping.py RUN_DIR [RUN_DIR ...] [-o OUT.png]
+                                      [--fit-window TMIN TMAX]
 
-output_directory defaults to the current directory and should contain
-the full bulk*.vlsv time series landau_damping.cfg writes (one at t=0,
-then one every system_write_t_interval up to t_max).
+Each RUN_DIR holds a bulk*.vlsv time series. Labels (CSL-RME-WG/WO, theta)
+and all physical/grid parameters come from the run config that Vlasiator
+embeds in every VLSV file, so they cannot drift from what was actually run.
+
+Caveat: Vlasiator embeds only the --run_config file. Options given on the
+command line or in global/user config files are not visible here.
 """
 
-import sys
+import argparse
 import glob
 import os
+from fractions import Fraction
+
 import numpy as np
-from scipy.special import wofz
 from scipy.optimize import root
 from scipy.signal import find_peaks
+from scipy.special import wofz
 
 try:
     import analysator as pt
@@ -30,100 +34,225 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+# Vlasiator's own constants (common.h) so omega_pe and lambda_D match the run
+Q_E = 1.60217653e-19
+M_ELECTRON = 9.10938188e-31
+M_PROTON = 1.67262158e-27
+K_B = 1.3806503e-23
+EPS_0 = 8.85418782e-12
+
+COLORS = ["tab:red", "tab:blue", "tab:green", "tab:purple"]
+
+# Defaults Vlasiator applies when a key is absent (parameters.cpp,
+# object_wrapper.cpp, projects/LandauDamping/LandauDamping.cpp)
+DEFAULTS = {
+    "fieldsolver.method": "default_fieldsolver",
+    "fieldsolver.theta": "0.5",
+    "fieldsolver.enforceGaussLaw": "true",
+    "LandauDamping.k": "1.0",
+    "_LandauDamping.rho": "1.0e6",
+    "_LandauDamping.Temperature": "1.0e5",
+    "_LandauDamping.densityPertRelAmp": "0.0",
+    "_properties.charge": "1",
+    "_properties.mass": "1",
+    "_properties.mass_units": "PROTON",
+}
+
+_BOOL = {"1": True, "true": True, "yes": True, "on": True,
+         "0": False, "false": False, "no": False, "off": False}
+
 
 # ============================================================
-# Physical parameters -- must match landau_damping.cfg exactly
+# Embedded config
 # ============================================================
 
-Q_E = 1.602176634e-19          # C
-M_ELECTRON = 9.1093837015e-31  # kg
-K_B = 1.380649e-23             # J/K
-EPS_0 = 8.8541878128e-12       # F/m
+def parse_config(text):
+    """Boost.Program_options rules: '#' starts a comment anywhere on a line,
+    '[sec]' prefixes later keys with 'sec.', repeated keys accumulate.
+    analysator's get_config() is not used: it also parses commented-out
+    'key = value' text."""
+    cfg, section = {}, ""
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            continue  # banner line Vlasiator prepends
+        key, val = (s.strip() for s in line.split("=", 1))
+        cfg.setdefault(f"{section}.{key}" if section else key, []).append(val)
+    return cfg
 
-Te = 1.0e5                     # K  -- electron_LandauDamping.Temperature
-ne = 1.0e6                     # m^-3 -- electron_LandauDamping.rho
-alpha0 = 0.01                  # electron_LandauDamping.densityPertRelAmp
-k_phys = 0.045824146786756774  # LandauDamping.k (m^-1)
 
-lambda_D = np.sqrt(EPS_0*K_B*Te/(Q_E**2*ne))
-omega_pe = np.sqrt(ne*Q_E**2/(EPS_0*M_ELECTRON))
-klD = k_phys*lambda_D  # should be ~1 (the paper's own dimensionless k, given lambda=1)
+def cfg_scalar(cfg, key, default_key=None):
+    vals = cfg.get(key)
+    if vals is None:
+        return DEFAULTS[default_key or key]
+    if len(vals) > 1:
+        # Vlasiator would not accept this either; refuse rather than guess
+        raise ValueError(f"config key {key!r} given {len(vals)} times: {vals}")
+    return vals[0]
+
+
+def run_settings(cfg):
+    """Field-solver settings and physics of the perturbed species."""
+    method = cfg_scalar(cfg, "fieldsolver.method")
+    theta = float(cfg_scalar(cfg, "fieldsolver.theta"))
+    gauss_str = cfg_scalar(cfg, "fieldsolver.enforceGaussLaw").lower()
+    if gauss_str not in _BOOL:
+        raise ValueError(f"cannot parse fieldsolver.enforceGaussLaw = {gauss_str!r}")
+
+    pops = cfg.get("ParticlePopulations", [])
+    pert = [p for p in pops
+            if float(cfg_scalar(cfg, f"{p}_LandauDamping.densityPertRelAmp",
+                                "_LandauDamping.densityPertRelAmp")) != 0.0]
+    if len(pert) != 1:
+        raise ValueError(f"expected exactly one perturbed population, found {pert} in {pops}")
+    p = pert[0]
+
+    units = cfg_scalar(cfg, f"{p}_properties.mass_units", "_properties.mass_units")
+    if units not in ("PROTON", "ELECTRON"):
+        raise ValueError(f"unknown mass_units {units!r} for population {p!r}")
+    mass = float(cfg_scalar(cfg, f"{p}_properties.mass", "_properties.mass")) * \
+        (M_PROTON if units == "PROTON" else M_ELECTRON)
+
+    return {
+        "method": method,
+        "theta": theta,
+        "gauss": _BOOL[gauss_str],
+        "pop": p,
+        "k": float(cfg_scalar(cfg, "LandauDamping.k")),
+        "n": float(cfg_scalar(cfg, f"{p}_LandauDamping.rho", "_LandauDamping.rho")),
+        "T": float(cfg_scalar(cfg, f"{p}_LandauDamping.Temperature",
+                              "_LandauDamping.Temperature")),
+        "alpha0": float(cfg_scalar(cfg, f"{p}_LandauDamping.densityPertRelAmp",
+                                   "_LandauDamping.densityPertRelAmp")),
+        "q": abs(int(cfg_scalar(cfg, f"{p}_properties.charge", "_properties.charge"))) * Q_E,
+        "m": mass,
+    }
+
+
+def format_theta(theta):
+    fr = Fraction(theta).limit_denominator(8)
+    return str(fr) if abs(float(fr) - theta) < 1e-12 else f"{theta:g}"
+
+
+def scheme_label(s):
+    if s["method"] not in ("AP", "LCCL"):   # the solver was renamed to LCCL
+        return f"fieldsolver={s['method']}"
+    return f"CSL-RME-{'WG' if s['gauss'] else 'WO'}, θ={format_theta(s['theta'])}"
 
 
 # ============================================================
-# Independent linear theory: solve the Landau-damping dispersion
-# relation directly, rather than trusting the paper's stated gamma=-0.85.
+# Linear theory
 # ============================================================
 
 def solve_landau_dispersion(klD, guess=(1.5, -0.5)):
-    """Standard 1D-Maxwellian Vlasov-Poisson dispersion relation,
-    Fried-Conte convention:
-        eps(k,omega) = 1 + (1/(k*lambdaD)^2) * [1 + zeta*Z(zeta)] = 0
-        zeta = (omega/omega_pe) / (k*lambdaD*sqrt(2))
-        Z(zeta) = i*sqrt(pi)*wofz(zeta)   [plasma dispersion function]
-    Returns omega/omega_pe (complex) for the least-damped root near
-    `guess`.
-    """
-    def Z(zeta):
-        return 1j*np.sqrt(np.pi)*wofz(zeta)
-
-    def dispersion(omega_over_wpe):
-        zeta = omega_over_wpe/(klD*np.sqrt(2))
-        return 1 + (1.0/klD**2)*(1 + zeta*Z(zeta))
-
+    """Least-damped root of eps = 1 + [1 + zeta Z(zeta)]/(k lambda_D)^2,
+    zeta = (omega/omega_pe)/(sqrt(2) k lambda_D), Fried-Conte Z.
+    Returns omega/omega_pe (complex)."""
     def eqs(v):
-        om = v[0] + 1j*v[1]
-        e = dispersion(om)
+        zeta = (v[0] + 1j * v[1]) / (klD * np.sqrt(2))
+        e = 1 + (1.0 / klD**2) * (1 + zeta * 1j * np.sqrt(np.pi) * wofz(zeta))
         return [e.real, e.imag]
 
     sol = root(eqs, guess, tol=1e-14)
     if not sol.success:
-        raise RuntimeError(f"Dispersion-relation root find failed: {sol.message}")
-    return sol.x[0] + 1j*sol.x[1]
+        raise RuntimeError(f"dispersion-relation root find failed: {sol.message}")
+    return sol.x[0] + 1j * sol.x[1]
 
 
 # ============================================================
-# Loading helpers
+# Loading
 # ============================================================
-
-def find_bulk_files(directory):
-    files = sorted(glob.glob(os.path.join(directory, "bulk*.vlsv")))
-    if len(files) < 2:
-        raise RuntimeError(
-            f"Expected at least 2 bulk*.vlsv files in {directory!r}, found {len(files)}"
-        )
-    tagged = []
-    for fn in files:
-        f = pt.vlsvfile.VlsvReader(fn)
-        t = f.read_parameter('time')
-        tagged.append((t, fn))
-    tagged.sort(key=lambda x: x[0])
-    return tagged
-
 
 def load_vg_field(f, name):
-    cellids = f.read_variable('cellid')
-    order = cellids.argsort()
-    return f.read_variable(name)[order]
+    cellids = f.read_variable("cellid")
+    return f.read_variable(name)[cellids.argsort()]
 
 
-def cellid_to_x(f, Lx, Nx):
-    """For this specific grid (Ny=Nz=1), DCCRG's CellID numbering runs
-    sequentially along x (CellID = i, 1-indexed), so x(CellID) =
-    (CellID-0.5)*dx directly"""
-    cellids = f.read_variable('cellid')
-    order = cellids.argsort()
-    cellids_sorted = cellids[order]
-    dx = Lx/Nx
-    return (cellids_sorted - 0.5)*dx
+def load_run(run_dir):
+    files = sorted(glob.glob(os.path.join(run_dir, "bulk*.vlsv")))
+    if len(files) < 2:
+        raise RuntimeError(f"expected >= 2 bulk*.vlsv files in {run_dir!r}, found {len(files)}")
+
+    recs = []
+    for fn in files:
+        f = pt.vlsvfile.VlsvReader(fn)
+        text = f.get_config_string() if hasattr(f, "get_config_string") else None
+        if text is None:
+            raise RuntimeError(f"{fn}: no embedded config (or analysator too old)")
+        recs.append((f.read_parameter("time"), fn, f, run_settings(parse_config(text))))
+    recs.sort(key=lambda r: r[0])
+
+    # restarts can rewrite an output time; keep one file per time
+    _, first = np.unique([r[0] for r in recs], return_index=True)
+    recs = [recs[i] for i in sorted(first)]
+
+    s0 = recs[0][3]
+    mixed = sorted({os.path.basename(r[1]) for r in recs if r[3] != s0})
+    if mixed:
+        print(f"WARNING [{run_dir}]: settings differ from {os.path.basename(recs[0][1])} in "
+              f"{len(mixed)} file(s), e.g. {mixed[:3]}; label uses the first file")
+
+    f0 = recs[0][2]
+    if f0.read_parameter("ycells_ini") != 1 or f0.read_parameter("zcells_ini") != 1:
+        raise RuntimeError(f"{run_dir}: E_Ex integral below assumes a 1D grid (Ny=Nz=1)")
+    xmin, xmax = f0.read_parameter("xmin"), f0.read_parameter("xmax")
+    Nx = int(f0.read_parameter("xcells_ini"))
+    dx = (xmax - xmin) / Nx
+
+    E_Ex = np.array([0.5 * np.sum(r[2].read_variable("fg_e")[..., 0].ravel()**2) * dx
+                     for r in recs])
+    return {
+        "dir": run_dir, "settings": s0, "mixed": bool(mixed),
+        "times": np.array([r[0] for r in recs]), "E_Ex": E_Ex,
+        "f0": f0, "xmin": xmin, "dx": dx, "Nx": Nx,
+    }
 
 
-def Ex_energy(f, dx):
-    """E_Ex = 0.5*integral(Ex^2) dx, via a simple Riemann sum over the
-    uniform, periodic x-grid"""
-    fg_e = f.read_variable('fg_e')
-    Ex = fg_e[..., 0].ravel()
-    return 0.5*np.sum(Ex**2)*dx
+def derived(s):
+    omega_pe = np.sqrt(s["n"] * s["q"]**2 / (EPS_0 * s["m"]))
+    lambda_D = np.sqrt(EPS_0 * K_B * s["T"] / (s["q"]**2 * s["n"]))
+    return omega_pe, s["k"] * lambda_D
+
+
+def sanity_checks(run):
+    s, f0, Nx = run["settings"], run["f0"], run["Nx"]
+    x = (load_vg_field(f0, "cellid") - 0.5) * run["dx"] + run["xmin"]
+    rho = load_vg_field(f0, f"{s['pop']}/vg_rho")
+    diff = rho - s["n"] * (1.0 + s["alpha0"] * np.sin(s["k"] * x))
+    err = np.max(np.abs(diff))
+    tol = s["n"] * 1e-6
+    print(f"  rho(t=0) vs n(1+alpha0 sin kx): max|diff| = {err:.4e} (tol {tol:.4e}) "
+          f"[{'PASS' if err < tol else 'FAIL'}]")
+    # sparse pruning lowers n uniformly; separate that from a wrong profile
+    err_shape = np.max(np.abs(diff - diff.mean()))
+    print(f"    uniform offset {diff.mean() / s['n']:+.3e} relative (sparse pruning); "
+          f"shape with offset removed: max|diff| = {err_shape:.4e} "
+          f"[{'PASS' if err_shape < tol else 'FAIL'}]")
+
+    Ex0 = f0.read_variable("fg_e")[..., 0].ravel()
+    # cell-centred samples never hit k*x = 0, hence cos(pi/Nx)
+    amp_pred = s["q"] * s["n"] * s["alpha0"] / (EPS_0 * s["k"]) * np.cos(np.pi / Nx)
+    amp = 0.5 * (Ex0.max() - Ex0.min())
+    err = abs(amp - amp_pred)
+    print(f"  Ex(t=0) amplitude: actual {amp:.6e}, predicted {amp_pred:.6e}, diff {err:.4e} "
+          f"(tol {amp_pred * 1e-3:.4e}) [{'PASS' if err < amp_pred * 1e-3 else 'FAIL'}]")
+
+
+def fit_envelope(t_wpe, E, window):
+    """gamma/omega_pe from local maxima of E_Ex inside `window`."""
+    idx = np.where((t_wpe >= window[0]) & (t_wpe <= window[1]))[0]
+    pk, _ = find_peaks(E[idx])
+    pk = idx[pk]
+    pk = pk[E[pk] > 0]
+    if len(pk) < 3:
+        return None, pk
+    # E_Ex ~ exp(2 gamma t)
+    return np.polyfit(t_wpe[pk], np.log(E[pk]), 1)[0] / 2.0, pk
 
 
 # ============================================================
@@ -131,134 +260,80 @@ def Ex_energy(f, dx):
 # ============================================================
 
 def main():
-    directory = sys.argv[1] if len(sys.argv) > 1 else "."
-    tagged = find_bulk_files(directory)
-    times = np.array([t for t, _ in tagged])
-    files = [fn for _, fn in tagged]
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("runs", nargs="+", help="1-4 run directories with bulk*.vlsv")
+    ap.add_argument("-o", "--output", default="landau_damping_comparison.png")
+    ap.add_argument("--fit-window", nargs=2, type=float, default=(0.0, 7.0),
+                    metavar=("TMIN", "TMAX"),
+                    help="t*omega_pe range for the envelope fit (default 0 7). Peaks "
+                         "after the signal reaches the numerical floor are shoulders "
+                         "of the floor, not of the damped mode.")
+    args = ap.parse_args()
+    if len(args.runs) > len(COLORS):
+        ap.error(f"at most {len(COLORS)} runs")
 
-    print(f"Found {len(files)} bulk files, t in [{times[0]:.4e}, {times[-1]:.4e}] s")
+    runs = [load_run(d) for d in args.runs]
 
-    f0 = pt.vlsvfile.VlsvReader(files[0])
-    # Lx, Nx, dx known exactly from the CFG itself
-    Lx = 2*np.pi/k_phys
-    Nx = 64
-    dx = Lx/Nx
-    xg = cellid_to_x(f0, Lx, Nx)
+    base = [scheme_label(r["settings"]) + (" [mixed cfg]" if r["mixed"] else "") for r in runs]
+    labels = [f"{lab} [{os.path.basename(os.path.normpath(r['dir']))}]" if base.count(lab) > 1 else lab
+              for lab, r in zip(base, runs)]
 
-    print(f"\n=== Independent linear theory (this script's own dispersion-relation solve) ===")
-    print(f"k*lambda_D = {klD:.6f}  (should be ~1.0, the paper's own dimensionless k*lambda)")
-    omega_root = solve_landau_dispersion(klD)
-    gamma_theory = omega_root.imag  # in units of omega_pe
-    omega_r_theory = omega_root.real
-    print(f"omega/omega_pe = {omega_root.real:.6f} + {omega_root.imag:.6f}j")
-    print(f"  => gamma_theory/omega_pe = {gamma_theory:.6f}  (paper's stated value: -0.85)")
-    print(f"  => real oscillation frequency omega_r/omega_pe = {omega_r_theory:.6f}")
-    print(f"     (E_Ex oscillates at 2*omega_r on top of the exp(2*gamma*t) envelope decay --")
-    print(f"      period ~ {np.pi/omega_r_theory:.4f} in omega_pe*t units)")
-    gamma_paper = -0.85
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    theory = {}  # klD -> (gamma, anchoring run index)
+    print()
+    for i, (run, lab) in enumerate(zip(runs, labels)):
+        s = run["settings"]
+        omega_pe, klD = derived(s)
+        t_wpe = run["times"] * omega_pe
+        E = run["E_Ex"]
+        print(f"=== {lab}  ({run['dir']}, {len(E)} files, t*omega_pe in "
+              f"[{t_wpe[0]:.3f}, {t_wpe[-1]:.3f}]) ===")
+        print(f"  method={s['method']} theta={s['theta']} enforceGaussLaw={s['gauss']} "
+              f"k*lambda_D={klD:.6f} alpha0={s['alpha0']}")
+        sanity_checks(run)
 
-    # ---- t=0 sanity checks ----
-    print(f"\n=== t=0 sanity checks ===")
-    rho_e0 = load_vg_field(f0, 'electron/vg_rho')
-    rho_e0_pred = ne*(1.0 + alpha0*np.sin(k_phys*xg))
-    err_rho = np.max(np.abs(rho_e0 - rho_e0_pred))
-    print(f"  electron rho(t=0) vs ne*(1+alpha0*sin(kx)): max|actual-predicted| = {err_rho:.4e} "
-          f"(tol = {ne*1e-6:.4e})  [{'PASS' if err_rho < ne*1e-6 else 'FAIL'}]")
+        key = round(klD, 9)
+        if key not in theory:
+            theory[key] = (solve_landau_dispersion(klD), i)
+        gamma_th = theory[key][0].imag
 
-    fg_e0 = f0.read_variable('fg_e')
-    Ex0 = fg_e0[..., 0].ravel()
-    # That amplitude needs one correction: the discrete sample
-    # points are CELL-CENTERED at x_i=(i-0.5)*dx, so k*x_i never actually
-    # reaches k*x=0 (the true continuum peak of cos(kx)) -- the closest
-    # sampled angle is k*x_1=pi/Nx, so the discrete max is
-    # cos(pi/Nx)*(continuum amplitude), not the continuum amplitude
-    # itself.
-    Ex0_amp_continuum = Q_E*ne*alpha0/(EPS_0*k_phys)
-    Ex0_amp_pred = Ex0_amp_continuum*np.cos(np.pi/Nx)
-    Ex0_amp_actual = 0.5*(np.max(Ex0) - np.min(Ex0))
-    err_amp = abs(Ex0_amp_actual - Ex0_amp_pred)
-    print(f"  fg_e(t=0) amplitude vs Q*ne*alpha0/(eps0*k)*cos(pi/Nx): actual={Ex0_amp_actual:.6e}, "
-          f"predicted={Ex0_amp_pred:.6e}, diff={err_amp:.4e} "
-          f"(tol = {Ex0_amp_pred*1e-3:.4e})  [{'PASS' if err_amp < Ex0_amp_pred*1e-3 else 'FAIL'}]")
+        gamma_fit, pk = fit_envelope(t_wpe, E, args.fit_window)
+        if gamma_fit is None:
+            print(f"  fewer than 3 envelope peaks in {args.fit_window}: no fit")
+            curve_label = lab
+        else:
+            print(f"  fitted gamma/omega_pe = {gamma_fit:.6f} from peaks at t*omega_pe = "
+                  f"{np.round(t_wpe[pk], 2).tolist()}  (theory {gamma_th:.6f}, "
+                  f"{abs(gamma_fit - gamma_th) / abs(gamma_th) * 100:.2f}% off)")
+            curve_label = f"{lab}  (fit $\\gamma/\\omega_{{pe}}$={gamma_fit:.3f})"
+            ax.plot(t_wpe[pk], E[pk], "^", color=COLORS[i], markersize=5)
+        ax.semilogy(t_wpe, E, "-", color=COLORS[i], linewidth=1.4, label=curve_label)
+        run["t_wpe"] = t_wpe
 
-    # ---- Time series: E_Ex(t) ----
-    print(f"\n=== Computing E_Ex(t) over {len(files)} files ===")
-    E_Ex = np.array([Ex_energy(pt.vlsvfile.VlsvReader(fn), dx) for fn in files])
-    E_Ex0 = E_Ex[0]
-    print(f"  E_Ex(t=0) = {E_Ex0:.6e}")
+    # Theory line anchored by least squares to the first run with that k*lambda_D
+    t_max = max(r["t_wpe"][-1] for r in runs)
+    for klD, (om, i) in theory.items():
+        r = runs[i]
+        m = (r["t_wpe"] >= args.fit_window[0]) & (r["t_wpe"] <= args.fit_window[1]) & (r["E_Ex"] > 0)
+        if m.sum() < 2:
+            continue
+        logA = np.mean(np.log(r["E_Ex"][m]) - 2 * om.imag * r["t_wpe"][m])
+        tl = np.linspace(0.0, t_max, 200)
+        extra = f", $k\\lambda_D$={klD:.3f}" if len(theory) > 1 else ""
+        ax.semilogy(tl, np.exp(logA + 2 * om.imag * tl), "k--", linewidth=1.1,
+                    label=f"linear theory: $\\gamma/\\omega_{{pe}}$={om.imag:.4f}{extra}")
 
-    # ---- Fit the simulation's own decay rate from the oscillation envelope (local maxima)
-    t_dimless = times*omega_pe  # paper's own time axis is in units of 1/omega_pe (t0)
-    fit_mask = t_dimless < min(8.0, t_dimless[-1])
-    peak_idx, _ = find_peaks(E_Ex[fit_mask])
-    gamma_sim = None
-    if len(peak_idx) >= 3:
-        t_peaks = times[peak_idx]
-        E_peaks = E_Ex[peak_idx]
-        valid = E_peaks > 0
-        if np.sum(valid) >= 3:
-            # log(E_Ex) = log(E_Ex0') + 2*gamma*omega_pe*t  (E_Ex ~ exp(2*gamma*t))
-            coeffs = np.polyfit(t_peaks[valid]*omega_pe, np.log(E_peaks[valid]), 1)
-            gamma_sim = coeffs[0]/2.0  # in units of omega_pe
-            print(f"  Simulation's own fitted decay rate (from {np.sum(valid)} envelope peaks): "
-                  f"gamma_sim/omega_pe = {gamma_sim:.6f}")
-            print(f"    vs gamma_theory = {gamma_theory:.6f}  "
-                  f"(relative difference: {abs(gamma_sim-gamma_theory)/abs(gamma_theory)*100:.2f}%)")
-    if gamma_sim is None:
-        print("  Not enough clear envelope peaks found to fit an empirical decay rate "
-              "(try a longer t_max or finer system_write_t_interval).")
-
-    # ============================================================
-    # Plot: reproduce Figure 1(a)
-    # ============================================================
-    fig, ax = plt.subplots(figsize=(7, 5))
-
-    ax.semilogy(t_dimless, E_Ex, 'r-', linewidth=1.5, label='CSL-RME-WG (this run)')
-
-    # Theoretical decay lines: E_Ex(t) = E_Ex0 * exp(2*gamma*omega_pe*t).
-    # Normalization: fit each line's own prefactor by least-squares
-    # matching log(E_Ex) over an early-to-mid time window
-    if np.sum(fit_mask) >= 2 and np.all(E_Ex[fit_mask] > 0):
-        logE_fit = np.log(E_Ex[fit_mask])
-
-        def fit_prefactor(gamma):
-            # log(E) = log(A) + 2*gamma*t  -> log(A) = mean(logE - 2*gamma*t)
-            logA = np.mean(logE_fit - 2*gamma*t_dimless[fit_mask])
-            return np.exp(logA)
-
-        A_theory = fit_prefactor(gamma_theory)
-        #A_paper = fit_prefactor(gamma_paper)
-        t_line = np.linspace(t_dimless[0], t_dimless[-1], 200)
-        ax.semilogy(t_line, A_theory*np.exp(2*gamma_theory*t_line), 'k--', linewidth=1.3, label=f'linear theory: ' f'$\\gamma/\\omega_{{pe}}$={gamma_theory:.4f}')
-        #xJax.semilogy(t_line, A_paper*np.exp(2*gamma_paper*t_line), 'b:', linewidth=1.8, label=f"paper's stated $\\gamma/\\omega_{{pe}}$={gamma_paper:.2f}")
-
-    if gamma_sim is not None:
-        ax.plot(times[peak_idx]*omega_pe, E_Ex[peak_idx], 'g^', markersize=6,
-                label=f'this run\'s own fitted envelope: $\\gamma/\\omega_{{pe}}$={gamma_sim:.4f}')
-
-    ax.set_xlabel(r'$t \, \omega_{pe}$')
-    ax.set_ylabel(r'$\mathcal{E}_{Ex} = \frac{1}{2}\int |E_x|^2\,dx$')
-    ax.set_title('Landau damping (Section 5.1, Liu et al. 2025) -- CSL-RME-WG\n'
-                  f'$k\\lambda_D$={klD:.3f}, $\\beta$=2, $\\alpha_0$={alpha0}', fontsize=11)
-    ax.legend(fontsize=8, loc='upper right')
-    ax.grid(True, which='both', alpha=0.3)
+    common = {(round(derived(r["settings"])[1], 6), r["settings"]["alpha0"]) for r in runs}
+    sub = (f"$k\\lambda_D$={next(iter(common))[0]:.3f}, $\\beta$=2, "
+           f"$\\alpha_0$={next(iter(common))[1]}") if len(common) == 1 else "parameters differ, see legend"
+    ax.set_title(f"Landau damping (Sec. 5.1, Liu et al. 2025)\n{sub}", fontsize=11)
+    ax.set_xlabel(r"$t \, \omega_{pe}$")
+    ax.set_ylabel(r"$\mathcal{E}_{Ex} = \frac{1}{2}\int |E_x|^2\,dx$")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
-
-    outpath = os.path.join(directory, 'landau_damping_fig1a.png')
-    fig.savefig(outpath, dpi=150)
-    print(f"\nSaved plot to {outpath}")
-
-    print(f"\n{'='*60}")
-    print(f"Summary: gamma/omega_pe")
-    print(f"  paper's stated value          : {gamma_paper:.6f}")
-    print(f"  this script's independent solve: {gamma_theory:.6f}  "
-          f"(diff from paper: {abs(gamma_theory-gamma_paper):.6f}, "
-          f"{abs(gamma_theory-gamma_paper)/abs(gamma_paper)*100:.2f}%)")
-    if gamma_sim is not None:
-        print(f"  this run's own empirical fit   : {gamma_sim:.6f}  "
-              f"(diff from theory: {abs(gamma_sim-gamma_theory):.6f}, "
-              f"{abs(gamma_sim-gamma_theory)/abs(gamma_theory)*100:.2f}%)")
-    print(f"{'='*60}")
+    fig.savefig(args.output, dpi=150)
+    print(f"\nSaved plot to {args.output}")
 
 
 if __name__ == "__main__":
