@@ -63,9 +63,9 @@ B0 = 0.5 * (abs(B[j0, :, 0].mean()) + abs(B[j1, :, 0].mean()))   # x-mean remove
 wci = QE * B0 / MP
 for k, y in enumerate(sheets):
     b = line_By(B, y)
-    nulls = int(np.sum(np.sign(b) != np.sign(np.roll(b, -1))))
+    nulls = int(np.sum(b * np.roll(b, -1) < 0))                     # strict: exact zeros are not nulls
     print(f"sheet {k+1}: {nulls} By sign changes along the sheet at t=0 "
-          f"(2 = one X- and one O-line; 4 = the old two-island perturbation)")
+          f"(2 = one X- and one O-line; 4 = the old two-island perturbation; 1 = the localized X-point)")
 print(f"B0 = {B0:.6e} T, 1/w_ci = {1/wci:.6e} s, d_i = {DI:.6e} m")
 
 xc = xmin + (np.arange(nx) + 0.5) * dx
@@ -80,8 +80,8 @@ def nulls(B, y, sg):
     out = []
     for i in range(nx):
         j = (i + 1) % nx
-        if b[i] == 0.0 or np.sign(b[i]) == np.sign(b[j]):
-            continue
+        if b[i] * b[j] >= 0.0:                    # strict sign change: exact zeros (e.g. outside a
+            continue                              # localized perturbation at t=0) are not nulls
         frac = b[i] / (b[i] - b[j])
         x0 = xc[i] + frac * dx
         x0 = x0 - Lx if x0 > xmax else x0

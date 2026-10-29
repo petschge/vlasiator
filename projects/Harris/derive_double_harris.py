@@ -115,10 +115,19 @@ LOW_PASS_FILTER = False # re-diffused B every step and drove the earlier bailout
 # perturbation's current (doubleSheet); 0 is the analytic Harris loading.
 CURRENT_LOADING = 1
 # Harris.symmetrySeed (needs the harris-symmetry-seed patch): odd-in-x term at each X-line, relative
-# to phi0, that breaks the x -> -x symmetry pinning a secondary island at x=0. 0.01 moves the X-line
-# by ~0.17 d_i and adds |dB| <~ 1e-3 B0. Written to MODE="2d" cfgs only (phi0 = 0 in 1d).
+# to the perturbation's flux (phi0, or A*B0*w if localized), that breaks the x -> -x symmetry pinning
+# a secondary island at x=0. With the island, 0.01 moves the X-line by ~0.17 d_i and adds
+# |dB| <~ 1e-3 B0. Written to MODE="2d" cfgs only (no perturbation in 1d).
 SYMMETRY_SEED = 0.01
 SEED_WIDTH_LAMBDA0 = 2.0   # Gaussian width in Scale_size units (2 = 1 d_i)
+# Harris.perturbationType (needs the harris-localized-perturbation patch for "localized"). "gem": the
+# island of Sec. 5.4, phi0 = 0.1 B0 d_i. "localized": instead the X-point of iPic3D's GEM setup
+# (Lapenta et al. 2010, ref. [68] of the paper): psi = A B0 w exp(-(X^2+Y^2)/w^2) cos(pi X/10w)
+# cos(pi Y/10w) at each X-line, |dB| up to 0.34 B0 for the defaults, whose peak flux A*w*B0 equals
+# the island's 2 phi0. MODE="2d" only.
+PERTURBATION = "gem"
+LOCAL_PERT_AMPLITUDE = 0.4         # A, in units of B0*w (iPic3D)
+LOCAL_PERT_WIDTH_LAMBDA0 = 1.0     # w in Scale_size units (1 = the sheet half-thickness, 0.5 d_i)
 
 GEOMETRY = "double"     # "double": two sheets, periodic; "single": one sheet, conducting walls
 # Cells per 25.6 lambda_i (the double-sheet height, and the width in 2d); the single sheet's
@@ -145,6 +154,10 @@ VDF_SHEET_LINES = True
 # into the edge cell (cpu_acc_map.cpp), so prefer it only where the +v edge is the one reached.
 WALL_BLOCK_MARGIN = 1
 RESTART_WALLTIME = 0.0  # io.restart_walltime_interval in s of walltime; 0 = no restart files
+GAUSS_LAW = True        # fieldsolver.enforceGaussLaw (Eq. 45 correction of E^{k+1})
+# vlasovsolver.maxSlAccelerationRotation: the largest gyration angle (degrees) one acceleration
+# subcycle may take; Vlasiator subcycles each step into pieces of this size plus a remainder.
+MAX_ACC_ROTATION = 25.0
 CFG_TAG = ""            # appended to the cfg file name
 # ==============================================================================
 
@@ -235,7 +248,10 @@ t_max = T_MAX_TCI * tci
 
 nb   = 0.2 * n0                  # background density
 phi0 = 0.1 * B0 * lam_i           # island perturbation amplitude
-phi0_run = phi0 if MODE == "2d" else 0.0
+if PERTURBATION not in ("gem", "localized"):
+    sys.exit(f"PERTURBATION must be 'gem' or 'localized', not {PERTURBATION!r}")
+LOCALIZED = MODE == "2d" and PERTURBATION == "localized"
+phi0_run = phi0 if (MODE == "2d" and not LOCALIZED) else 0.0
 CFG_NAME = f"{GEOMETRY}_harris_{MODE}{'_frozen' if FROZEN_FIELDS else ''}{CFG_TAG}.cfg"
 
 # ----- Velocity-space extents and block counts -----
@@ -265,10 +281,11 @@ minValue_e = SPARSITY_REL_BACKGROUND * f_peak(nb, Te, me)
 # centres, then adjustVelocityBlocks (grid.cpp, before any acceleration) keeps a block iff
 # it or one of its 26 velocity neighbours (blockAddWidthV=1) has a cell with f >= minValue.
 # Blocks kept for a spatial neighbour's content are bounded by the extremes over all rows.
-# The acceleration bails out once a target block falls within WALL_MARGIN_BLOCKS of the
-# wall, and any outward shift moves the outermost kept block into the next one, so at
-# least one spare block is required.
-WALL_MARGIN_BLOCKS = 1
+# With WALL_BLOCK_MARGIN=1 the acceleration bails out once a target block falls within one
+# block of the wall, and any outward shift moves the outermost kept block into the next one,
+# so at least one spare block is required. With 0 there is no bailout (the edge drops or
+# piles up what is pushed past it), so content may reach the edge, as on a full grid.
+WALL_MARGIN_BLOCKS = WALL_BLOCK_MARGIN
 
 def block_sparsity_check(label, mass, T, vts, vd, minValue, v_max, nblk):
     nc = nblk * WID
@@ -301,7 +318,7 @@ def block_sparsity_check(label, mass, T, vts, vd, minValue, v_max, nblk):
         retained = pref * dv**3 * sum(gsum[a] * gsum[b] * hsum[c] for (a, b, c) in kept)
         lost.append(1.0 - retained / (sum(nk for nk, _ in ns) + nb))
     spare = min_edge - WALL_MARGIN_BLOCKS
-    status = "PASS" if (spare >= 1 and empty_rows == 0) else "FAIL"
+    status = "PASS" if ((spare >= 1 or WALL_MARGIN_BLOCKS == 0) and empty_rows == 0) else "FAIL"
     print(f"  {label}: {nblk} blocks/dim, dv={dv/vts:.3f} v_ts, block={WID*dv/vts:.2f} v_ts, "
           f"spare blocks before wall margin={spare} [{status}]")
     print(f"           y-rows with no blocks={empty_rows}/{Ny}, max density truncated={max(lost):.2e}, "
@@ -370,16 +387,22 @@ if status_e == "FAIL" or status_i == "FAIL" or cfl_e >= 1.0:
 print()
 print("================ Field perturbation =============================")
 print(f"BX0 (Harris.BX0)             = {B0:.6e} T")
-print(f"perturbationAmplitude (phi0) = {phi0_run:.6e} T*m" + ("  (MODE=1d: off)" if MODE == "1d" else ""))
+if LOCALIZED:
+    print(f"perturbationType = localized: A = {LOCAL_PERT_AMPLITUDE:g}, w = {LOCAL_PERT_WIDTH_LAMBDA0:g} lambda0; "
+          f"peak flux {LOCAL_PERT_AMPLITUDE * LOCAL_PERT_WIDTH_LAMBDA0 * lam0 / lam_i:.4f} B0 d_i "
+          f"(the island's 2 phi0 = 0.2 B0 d_i)")
+else:
+    print(f"perturbationAmplitude (phi0) = {phi0_run:.6e} T*m" + ("  (MODE=1d: off)" if MODE == "1d" else ""))
 
 deviations = []
 if abs(C_LIGHT / va - 20.0) > 1e-6:
     deviations.append(f"c/v_a={C_LIGHT/va:.3g} instead of 20")
 if abs(dt / tci - 0.02) > 1e-9:
     deviations.append(f"dt={dt/tci:g}/w_ci instead of 0.02/w_ci")
-if (ION_VMAX_MULTIPLE, ELECTRON_VMAX_MULTIPLE) != (9.0, 8.0):
-    deviations.append(f"velocity boxes +-{ION_VMAX_MULTIPLE:g}v_ti and +-{ELECTRON_VMAX_MULTIPLE:g}v_te "
-                      f"instead of +-9v_ti and +-8v_te")
+if (ION_VMAX_MULTIPLE, ELECTRON_VMAX_MULTIPLE) != (9.0, 8.0) or WID * blocks_i != 26 or WID * blocks_e != 26:
+    deviations.append(f"velocity boxes +-{ION_VMAX_MULTIPLE:g}v_ti and +-{ELECTRON_VMAX_MULTIPLE:g}v_te with "
+                      f"{WID*blocks_i} and {WID*blocks_e} cells per dimension instead of +-9v_ti and +-8v_te "
+                      f"with 26 (Vlasiator's velocity blocks are {WID} cells wide)")
 if abs(dx / lam_i - 0.2) > 1e-9:
     deviations.append(f"dx=dy={dx/lam_i:g} lambda_i instead of 0.2")
 if (abs(dv_i / vti - PAPER_DV_ION) > 1e-3) or (abs(dv_e / vte - PAPER_DV_ELECTRON) > 1e-3):
@@ -387,7 +410,22 @@ if (abs(dv_i / vti - PAPER_DV_ION) > 1e-3) or (abs(dv_e / vte - PAPER_DV_ELECTRO
 if GEOMETRY == "double":
     deviations.append("two opposite-polarity sheets in a fully periodic box instead of one sheet "
                       "between conducting walls")
-deviations.append(f"theta={THETA:g} (the paper does not state its value for Sec. 5.4)")
+if THETA != 0.5:
+    deviations.append(f"theta={THETA:g} instead of 1/2 (the paper's value unless otherwise specified)")
+if not GAUSS_LAW:
+    deviations.append("no Gauss-law correction")
+deviations.append(f"sparse velocity mesh, blocks below {SPARSITY_REL_BACKGROUND:g} of the background "
+                  "peak f dropped (the paper's velocity grids are full)")
+if CURRENT_LOADING:
+    deviations.append(f"sheet drifts scaled to match the solver's discrete curl B (currentLoading={CURRENT_LOADING})")
+if LOCALIZED:
+    deviations.append(f"a localized X-point perturbation (A = {LOCAL_PERT_AMPLITUDE:g}, w = "
+                      f"{LOCAL_PERT_WIDTH_LAMBDA0:g} lambda0, as in iPic3D's GEM setup, Lapenta et al. 2010) "
+                      "instead of the GEM island")
+if MODE == "2d" and SYMMETRY_SEED != 0:
+    deviations.append(f"symmetry-breaking seed {SYMMETRY_SEED:g} at the X-line")
+if WALL_BLOCK_MARGIN == 0:
+    deviations.append("velocity-space edges drop (+v) or pile up (-v) what is pushed past them")
 if LOW_PASS_FILTER:
     deviations.append("lowPassFilter=1, which is not in the paper")
 stage = ("1D x-invariant equilibrium test, no perturbation, " + ("fields FROZEN (B fixed, E=0)" if FROZEN_FIELDS else "LCCL field solve on")
@@ -398,8 +436,9 @@ geometry_note = ("# DOUBLE Harris-sheet variant of the GEM reconnection challeng
                  "# GEM reconnection challenge as in Liu, Cai, Cao & Lapenta 2025, JCP 528:113840,\n"
                  "# Section 5.4: one Harris sheet between conducting walls, periodic in x.")
 geometry_note += "\n# See derive_double_harris.py's module docstring."
-requires_extra = ("; harris-single-sheet.patch for the face-evaluated single-sheet perturbation"
-                  if GEOMETRY == "single" else "")
+requires_base = "682924ca" if GEOMETRY == "single" else "c6bf907"
+requires_extra = ("; harris-localized-perturbation.patch for Harris.perturbationType = localized"
+                  if LOCALIZED else "")
 stage_note = textwrap.fill(f"Stage: {stage}; {Nx} x {Ny} cells, t_max = {T_MAX_TCI:g}/w_ci "
                            f"({t_max/dt:.0f} steps).", width=80, initial_indent="# ", subsequent_indent="# ")
 deviation_note = textwrap.fill(
@@ -407,8 +446,13 @@ deviation_note = textwrap.fill(
     else "No deviations from the paper's Section 5.4 parameters.",
     width=80, initial_indent="# ", subsequent_indent="# ")
 
+vlasov_block = ("[vlasovsolver]\nmaxSlAccelerationRotation = " + f"{MAX_ACC_ROTATION:g}" + "\n\n"
+                if MAX_ACC_ROTATION != 25.0 else "")
 seed_lines = (f"symmetrySeed = {SYMMETRY_SEED:g}\nsymmetrySeedWidth = {SEED_WIDTH_LAMBDA0:g}\n"
               if MODE == "2d" else "")
+pert_lines = (f"perturbationType = localized\nlocalizedAmplitude = {LOCAL_PERT_AMPLITUDE:g}\n"
+              f"localizedWidth = {LOCAL_PERT_WIDTH_LAMBDA0:g}\n" if LOCALIZED
+              else f"perturbationAmplitude = {phi0_run:.9e}\n")
 if GEOMETRY == "double":
     boundary_block = """[boundaries]
 periodic_x = yes
@@ -463,12 +507,12 @@ cfg = f"""\
 #
 {stage_note}
 {override_note}#
-# Requires: petschge/vlasiator ca0a894 or later{requires_extra}.
+# Requires: petschge/vlasiator {requires_base} or later{requires_extra}.
 #
 # Generated by derive_double_harris.py -- DO NOT hand-edit the derived
 # numbers below; edit the free choices (n0, v_a, *_VMAX_MULTIPLE, DV_*,
 # SPARSITY_REL_BACKGROUND, THETA, LOW_PASS_FILTER, CURRENT_LOADING, SYMMETRY_SEED,
-# SEED_WIDTH_LAMBDA0, GEOMETRY, NY, DT_TCI, MODE, VDF_SHEET_LINES, WALL_BLOCK_MARGIN,
+# SEED_WIDTH_LAMBDA0, PERTURBATION, LOCAL_PERT_*, GEOMETRY, NY, DT_TCI, MODE, VDF_SHEET_LINES, WALL_BLOCK_MARGIN,
 # X_CELLS_1D, FROZEN_FIELDS, T_MAX_TCI, *_EVERY_TCI) at the top of that script
 # and rerun instead, so this file and its derivation stay in sync.
 #
@@ -517,10 +561,10 @@ min_dt = {dt*1e-3:.3e}
 velocity_space_wall_block_margin = {WALL_BLOCK_MARGIN}
 
 {boundary_block}
-[fieldsolver]
+{vlasov_block}[fieldsolver]
 method = LCCL
 theta = {THETA:g}
-enforceGaussLaw = 1
+enforceGaussLaw = {int(GAUSS_LAW)}
 lowPassFilter = {int(LOW_PASS_FILTER)}
 
 [Harris]
@@ -528,8 +572,7 @@ Scale_size = {lam0:.9e}
 BX0 = {B0:.9e}
 BY0 = 0.0
 BZ0 = 0.0
-perturbationAmplitude = {phi0_run:.9e}
-doubleSheet = {1 if GEOMETRY == "double" else 0}
+{pert_lines}doubleSheet = {1 if GEOMETRY == "double" else 0}
 currentLoading = {CURRENT_LOADING}
 {seed_lines}
 [proton_Harris]

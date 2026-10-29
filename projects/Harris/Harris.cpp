@@ -64,7 +64,20 @@ namespace projects {
               "curl of the initial B/mu0 (removes the step-1 current impulse at the sheets). 2: as 1, and "
               "also load the in-sheet share n_sheet/n_total of the perturbation's discrete current "
               "(doubleSheet only; needs a background population). Default 0.", this->CURRENT_LOADING, 0);
-      RP::add<Real>("Harris.symmetrySeed", "Amplitude, relative to perturbationAmplitude, of a localized term "
+      RP::add<std::string>("Harris.perturbationType", "Perturbation that starts reconnection. gem: the island of "
+              "Harris.perturbationAmplitude (Sec. 5.4 of Liu et al. 2025). localized: instead a localized X-point "
+              "at each sheet's X-line as in iPic3D's GEM setup (Lapenta et al. 2010, Phys. Plasmas 17, 082106), "
+              "delta_B = grad(psi) x e_z with psi = s*A*BX0*w*exp(-(X^2+Y^2)/w^2)*cos(pi*X/(10w))*cos(pi*Y/(10w)) "
+              "for |X|,|Y| < 5w and 0 outside (where it is below 1e-10 of its peak). X, Y: from the X-line; "
+              "A = Harris.localizedAmplitude, w = Harris.localizedWidth*Scale_size; s = +1 for the single sheet "
+              "and sheet 1, -1 for sheet 2. Its peak flux A*BX0*w is 0.2*B0*d_i with the defaults, the same as "
+              "the GEM island's 2*phi0. Default gem.", this->PERTURBATION_TYPE, "gem");
+      RP::add<Real>("Harris.localizedAmplitude", "Amplitude A of the localized perturbation, in units of BX0*w. "
+              "Default 0.4 (iPic3D).", this->LOCAL_AMPLITUDE, 0.4);
+      RP::add<Real>("Harris.localizedWidth", "Width w of the localized perturbation, in units of Scale_size. "
+              "Default 1 (iPic3D: the sheet half-thickness).", this->LOCAL_WIDTH, 1.0);
+      RP::add<Real>("Harris.symmetrySeed", "Amplitude, relative to the perturbation's flux (perturbationAmplitude, or "
+              "localizedAmplitude*BX0*w if localized), of a localized term "
               "phi_s = seed*phi0*(X/w)*exp(-(X^2+(Y-Y_sheet)^2)/w^2) added at each X-line (X = x-xmid). It is "
               "odd in x, so it breaks the x -> -x mirror symmetry that otherwise pins a secondary island "
               "at x=0; with doubleSheet, sheet 2 gets the rotation-by-pi image of sheet 1's term, so the "
@@ -87,6 +100,25 @@ namespace projects {
    
    void Harris::getParameters(){
       Project::getParameters();
+      if (this->PERTURBATION_TYPE != "gem" && this->PERTURBATION_TYPE != "localized") {
+         std::cerr << "Harris.perturbationType must be gem or localized, not " << this->PERTURBATION_TYPE << std::endl;
+         abort();
+      }
+      this->LOCALIZED_PERTURBATION = (this->PERTURBATION_TYPE == "localized");
+      this->LOCAL_WIDTH *= this->SCA_LAMBDA;
+      if (this->LOCALIZED_PERTURBATION) {
+         if (this->LOCAL_WIDTH <= 0.0) {
+            std::cerr << "Harris.localizedWidth must be positive" << std::endl;
+            abort();
+         }
+         if (this->PERT_AMPLITUDE != 0.0) {
+            // the localized perturbation replaces the island, including its current for currentLoading=2
+            std::cerr << "Harris.perturbationType=localized: Harris.perturbationAmplitude is ignored" << std::endl;
+            this->PERT_AMPLITUDE = 0.0;
+         }
+      }
+      this->SEED_REF = this->LOCALIZED_PERTURBATION ? this->LOCAL_AMPLITUDE * this->BX0 * this->LOCAL_WIDTH
+                                                    : this->PERT_AMPLITUDE;
 
       // Per-population parameters
       for(uint i=0; i< getObjectWrapper().particleSpecies.size(); i++) {
@@ -483,8 +515,11 @@ namespace projects {
          const auto Ly_l = 0.5 * (Parameters::ymax - Parameters::ymin);
          const auto xmid_l = 0.5 * (Parameters::xmax + Parameters::xmin);
          const auto ymid_l = 0.5 * (Parameters::ymax + Parameters::ymin);
-         const auto SEED_l = this->SEED_AMPLITUDE * this->PERT_AMPLITUDE;
+         const auto SEED_l = this->SEED_AMPLITUDE * this->SEED_REF;
          const auto SEEDW_l = this->SEED_WIDTH;
+         const auto LOCAL_l = this->LOCALIZED_PERTURBATION;
+         const auto LPSI_l = this->LOCAL_AMPLITUDE * this->BX0 * this->LOCAL_WIDTH;   // peak flux A*BX0*w
+         const auto LW_l = this->LOCAL_WIDTH;
 
          fsgrid.parallel_for([](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
                              phiprof::initializeTimer("setProjectBField-loop"), technical,
@@ -538,6 +573,36 @@ namespace projects {
                   cell[fsgrids::bfield::PERBX] += -PHI0_l * (M_PI / (2.0 * Ly_l)) * cos(M_PI * xf / Lx_l) * sin(M_PI * ycD / (2.0 * Ly_l));
                   cell[fsgrids::bfield::PERBY] +=  PHI0_l * (M_PI / Lx_l) * sin(M_PI * xcD / Lx_l) * cos(M_PI * yf / (2.0 * Ly_l));
                }
+            }
+
+            if (LOCAL_l) {
+               // Localized X-point at each sheet's X-line, as in iPic3D's GEM setup:
+               // psi = sum_k s_k*A*BX0*w*exp(-(X^2+(Y-Y_k)^2)/w^2)*cos(pi*X/(10w))*cos(pi*(Y-Y_k)/(10w)) for
+               // |X|,|Y-Y_k| < 5w (both cosines positive), 0 outside; delta_B = grad(psi) x e_z = (dpsi/dy, -dpsi/dx, 0).
+               // Each face value is the difference of psi between the face's two corners over its length,
+               // i.e. the exact face average, so the discrete div B vanishes to round-off however sharp the
+               // perturbation is on the grid. Sheet 2 (s=-1) is the rotation-by-pi image of sheet 1.
+               // Distances use the nearest periodic image, as for the seed.
+               const Real xf = xyz[0] - xmid_l, yf = xyz[1] - ymid_l;
+               const Real dx = gridSpacing[0], dy = gridSpacing[1];
+               const Real cx[3] = {xf, xf, xf + dx};          // corners: lower-left, upper-left, lower-right
+               const Real cy[3] = {yf, yf + dy, yf};
+               Real p[3] = {0.0, 0.0, 0.0};
+               const int nSheets = DOUBLE_SHEET_l ? 2 : 1;
+               for (int c = 0; c < 3; ++c) {
+                  for (int k = 0; k < nSheets; ++k) {
+                     const Real Yk = DOUBLE_SHEET_l ? (k == 0 ? -0.5 * Ly_l : 0.5 * Ly_l) : 0.0;
+                     const Real sk = (k == 0) ? 1.0 : -1.0;
+                     const Real X = cx[c] - 2.0 * Lx_l * std::floor((cx[c] + Lx_l) / (2.0 * Lx_l));
+                     const Real Y = (cy[c] - Yk) - 2.0 * Ly_l * std::floor((cy[c] - Yk + Ly_l) / (2.0 * Ly_l));
+                     if (std::fabs(X) < 5.0 * LW_l && std::fabs(Y) < 5.0 * LW_l) {
+                        p[c] += sk * LPSI_l * std::exp(-(X * X + Y * Y) / (LW_l * LW_l))
+                                * std::cos(M_PI * X / (10.0 * LW_l)) * std::cos(M_PI * Y / (10.0 * LW_l));
+                     }
+                  }
+               }
+               cell[fsgrids::bfield::PERBX] += (p[1] - p[0]) / dy;
+               cell[fsgrids::bfield::PERBY] -= (p[2] - p[0]) / dx;
             }
 
             if (SEED_l != 0.0) {

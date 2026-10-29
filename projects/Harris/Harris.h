@@ -83,7 +83,13 @@ namespace projects {
                                  solver's discrete curl(B)/mu0; 2: also the in-sheet share of the
                                  perturbation's current (doubleSheet) -- see getPopulationsAt(). */
       Real WALL_HALF_HEIGHT; /*!< single sheet: sheet-to-wall distance used by the perturbation; 0 = domain half-height */
-      Real SEED_AMPLITUDE; /*!< symmetry-breaking seed, relative to PERT_AMPLITUDE -- see setProjectBField() */
+      std::string PERTURBATION_TYPE; /*!< Harris.perturbationType, gem or localized */
+      bool LOCALIZED_PERTURBATION; /*!< Harris.perturbationType = localized: a localized X-point at each sheet's
+                                       X-line (iPic3D's GEM setup) replaces the island -- see setProjectBField() */
+      Real LOCAL_AMPLITUDE; /*!< its amplitude A; the peak flux is A*BX0*LOCAL_WIDTH */
+      Real LOCAL_WIDTH;     /*!< its Gaussian width w, m */
+      Real SEED_REF;        /*!< flux the symmetry seed is scaled by: PERT_AMPLITUDE, or A*BX0*w if localized */
+      Real SEED_AMPLITUDE; /*!< symmetry-breaking seed, relative to SEED_REF -- see setProjectBField() */
       Real SEED_WIDTH;     /*!< its Gaussian width, m */
       Real SHEET_CURRENT;  /*!< sum over species of q*DENSITY*DRIFT_V (A/m^2) */
       Real DENSITY_SUM;    /*!< sum over species of DENSITY */
