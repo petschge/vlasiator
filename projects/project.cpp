@@ -32,6 +32,7 @@
 
 #include "Alfven/Alfven.h"
 #include "Dispersion/Dispersion.h"
+#include "LCCL_reconnection/LCCL_reconnection.h"
 #include "LandauDamping/LandauDamping.h"
 #include "Distributions/Distributions.h"
 #include "Flowthrough/Flowthrough.h"
@@ -647,6 +648,7 @@ Project* createProject() {
         projects::verificationLarmor* _verificationLarmor = new projects::verificationLarmor();
         projects::KHB* _KHB = new projects::KHB();
         projects::Dispersion* _Dispersion = new projects::Dispersion();
+        projects::LCCL_Reconnection* _LCCL_Reconnection = new projects::LCCL_Reconnection();
         projects::Shock* _Shock = new projects::Shock();
         projects::Shocktest* _Shocktest = new projects::Shocktest();
         projects::Distributions* _Distributions=new projects::Distributions();
@@ -668,6 +670,7 @@ Project* createProject() {
         _verificationLarmor->addParameters();
         _KHB->addParameters();
         _Dispersion->addParameters();
+        _LCCL_Reconnection->addParameters();
         _Shock->addParameters();
         _Shocktest->addParameters();
         _LandauDamping->addParameters();
@@ -731,6 +734,9 @@ Project* createProject() {
 
     } else if (Parameters::projectName=="Dispersion") {
         project=new projects::Dispersion();
+
+    } else if (Parameters::projectName=="LCCL_reconnection") {
+        project=new projects::LCCL_Reconnection();
 
     } else if (Parameters::projectName=="LandauDamping") {
         project=new projects::LandauDamping();
