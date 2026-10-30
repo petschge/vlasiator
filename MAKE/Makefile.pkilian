@@ -26,8 +26,9 @@ MATHFLAGS = -ffast-math -fno-finite-math-only
 testpackage: MATHFLAGS = -fno-unsafe-math-optimizations
 LDFLAGS = -L ${PREFIX}/lib
 LIB_MPI = -lgomp
+# LIB_MPI =
 
-PREFIX = /tmp/vlasiator/libraries-pkilian/
+PREFIX = /home/pkilian/vlasiator_LCCL/libraries/
 LIBRARY_PREFIX = ${PREFIX}
 LIBRARY_PREFIX_B = ${PREFIX}
 
@@ -40,7 +41,10 @@ LDFLAGS += -lpapi
 INC_ZOLTAN =
 LIB_ZOLTAN = -L${PREFIX}/lib -lzoltan
 
-INC_VLSV =
+INC_HYRPE =
+LIB_HYPRE = -L${PREFIX}/lib -lHYPRE
+
+INC_VLSV = 
 LIB_VLSV = -lvlsv
 
 INC_SILO = -I${PREFIX}/include

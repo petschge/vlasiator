@@ -30,6 +30,9 @@ LIBRARY_PREFIX = ${CURDIR}/libraries-home
 INC_ZOLTAN = -I$(LIBRARY_PREFIX)/include
 LIB_ZOLTAN = -L${LIBRARY_PREFIX}/lib -lzoltan
 
+INC_HYRPE = -I$(LIBRARY_PREFIX)/include
+LIB_HYPRE = -L${LIBRARY_PREFIX}/lib -lHYPRE
+
 LIB_VLSV = -L$(LIBRARY_PREFIX)/lib -lvlsv
 INC_VLSV = -I$(LIBRARY_PREFIX)/include
 
