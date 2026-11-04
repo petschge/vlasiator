@@ -1,5 +1,6 @@
 #include "lccl_electric_field.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -327,6 +328,43 @@ static void lccl_PrepareInflowCharacteristic(std::span<const ApVec3> Ek, std::sp
  * Section 2: alpha_s / mu / J-hat  (Eqs. 35-37), evaluated at the nodes
  * ============================================================ */
 
+// Operators of the exact Lorentz push over dt with constant E and B, du/dt = (q/m)(E + u x B):
+//   u(dt) = R u + Phi (q/m) E,  R = exp(W dt),  Phi = int_0^dt exp(W s) ds,  W u = u x omega,  omega = (q/m) B.
+// This is what the Vlasov acceleration does (it composes 0.1-degree rotations with the E push).
+// With W^3 = -|omega|^2 W:
+//   R   = I + sin(psi)/|omega| W + (1 - cos psi)/|omega|^2 W^2,
+//   Phi = dt I + (1 - cos psi)/|omega|^2 W + (psi - sin psi)/|omega|^3 W^2,   psi = |omega| dt.
+// The coefficients are evaluated as dt^n f(psi) with series for small psi, so B = 0 is exact.
+static void lccl_ExactPushOperators(Real qOverM, Real Bx, Real By, Real Bz, Real dt,
+                                    std::array<Real,9>& R, std::array<Real,9>& Phi, Real& psi) {
+   const Real wx = qOverM*Bx, wy = qOverM*By, wz = qOverM*Bz;
+   const Real w2 = wx*wx + wy*wy + wz*wz;
+   psi = std::sqrt(w2)*std::fabs(dt);
+   Real sinc, c1, c2; // sin(psi)/psi, (1 - cos psi)/psi^2, (psi - sin psi)/psi^3
+   if (psi < 1e-3) {
+      const Real p2 = psi*psi;
+      sinc = 1.0 - p2/6.0 + p2*p2/120.0;
+      c1   = 0.5 - p2/24.0 + p2*p2/720.0;
+      c2   = 1.0/6.0 - p2/120.0 + p2*p2/5040.0;
+   } else {
+      sinc = std::sin(psi)/psi;
+      c1   = (1.0 - std::cos(psi))/(psi*psi);
+      c2   = (psi - std::sin(psi))/(psi*psi*psi);
+   }
+   const Real a1 = dt*sinc, a2 = dt*dt*c1, b2 = dt*dt*dt*c2;
+   const std::array<Real,9> W  = { 0.0,  wz, -wy,
+                                  -wz, 0.0,  wx,
+                                   wy, -wx, 0.0 };
+   const std::array<Real,9> W2 = { wx*wx - w2, wx*wy,      wx*wz,
+                                   wy*wx,      wy*wy - w2, wy*wz,
+                                   wz*wx,      wz*wy,      wz*wz - w2 };
+   for (int t = 0; t < 9; ++t) {
+      const Real I = (t % 4 == 0) ? 1.0 : 0.0;
+      R[t]   = I + a1*W[t] + a2*W2[t];
+      Phi[t] = dt*I + a2*W[t] + b2*W2[t];
+   }
+}
+
 void lccl_BuildSpeciesTensors(
    std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
    std::vector<fsgrids::speciesjspan>& speciesJ,
@@ -340,6 +378,7 @@ void lccl_BuildSpeciesTensors(
    ApNodeField& outJhat
 ) {
    const uint numPops = speciesRhoQ.size();
+   std::atomic<bool> gyrationBeyondPi{false};
 
    fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
@@ -365,29 +404,46 @@ void lccl_BuildSpeciesTensors(
             const Real Jy   = speciesJ[popID][lid][fsgrids::speciesj::SJY];
             const Real Jz   = speciesJ[popID][lid][fsgrids::speciesj::SJZ];
 
-            // eps_s = q_s * theta * dt / m_s  (Eq. 37)
             const Real charge = getObjectWrapper().particleSpecies[popID].charge;
             const Real mass   = getObjectWrapper().particleSpecies[popID].mass;
-            const Real eps = charge * theta * dt / mass;
-
-            const Real B2 = Bx*Bx + By*By + Bz*Bz;
-            const Real denom = 1.0 + eps*eps*B2;
-
-            // alpha_s = [I - eps * (I x B) + eps^2 * B B^T] / denom
-            std::array<Real,9> alpha;
-            alpha[0] = ( 1.0       + eps*eps*Bx*Bx) / denom;  // xx
-            alpha[1] = (-eps*(-Bz) + eps*eps*Bx*By) / denom;  // xy
-            alpha[2] = (-eps*( By) + eps*eps*Bx*Bz) / denom;  // xz
-            alpha[3] = (-eps*( Bz) + eps*eps*By*Bx) / denom;  // yx
-            alpha[4] = ( 1.0       + eps*eps*By*By) / denom;  // yy
-            alpha[5] = (-eps*(-Bx) + eps*eps*By*Bz) / denom;  // yz
-            alpha[6] = (-eps*(-By) + eps*eps*Bz*Bx) / denom;  // zx
-            alpha[7] = (-eps*( Bx) + eps*eps*Bz*By) / denom;  // zy
-            alpha[8] = ( 1.0       + eps*eps*Bz*Bz) / denom;  // zz
-
-            // mu += (q_s/m_s) * rho_s^k * alpha_s   (Eq. 36)
             const Real qOverM_rho = (charge/mass) * rhoQ;
-            for (int t = 0; t < 9; ++t) { mu[t] += qOverM_rho * alpha[t]; }
+            std::array<Real,9> alpha;
+
+            if (P::lcclMatchedCurrent) {
+               // Matched current prediction: the current the exact push over dt will produce from J*,
+               // J^{k+theta} = (1-theta) J* + theta J^{k+1} with J^{k+1} = R J* + (q/m) rho Phi E^{k+theta},
+               // i.e. J-hat with alpha_s = (1-theta) I + theta R_s and mu += (q_s/m_s) rho_s Phi_s / dt.
+               // For B = 0 this is identical to Eqs. 35-37. The rotation uses B^k, as alpha_s does.
+               std::array<Real,9> R, Phi;
+               Real psi;
+               lccl_ExactPushOperators(charge/mass, Bx, By, Bz, dt, R, Phi, psi);
+               if (psi >= M_PI) { gyrationBeyondPi.store(true, std::memory_order_relaxed); }
+               for (int t = 0; t < 9; ++t) {
+                  const Real I = (t % 4 == 0) ? 1.0 : 0.0;
+                  alpha[t] = (1.0 - theta)*I + theta*R[t];
+                  mu[t] += qOverM_rho * Phi[t] / dt;
+               }
+            } else {
+               // eps_s = q_s * theta * dt / m_s  (Eq. 37)
+               const Real eps = charge * theta * dt / mass;
+
+               const Real B2 = Bx*Bx + By*By + Bz*Bz;
+               const Real denom = 1.0 + eps*eps*B2;
+
+               // alpha_s = [I - eps * (I x B) + eps^2 * B B^T] / denom
+               alpha[0] = ( 1.0       + eps*eps*Bx*Bx) / denom;  // xx
+               alpha[1] = (-eps*(-Bz) + eps*eps*Bx*By) / denom;  // xy
+               alpha[2] = (-eps*( By) + eps*eps*Bx*Bz) / denom;  // xz
+               alpha[3] = (-eps*( Bz) + eps*eps*By*Bx) / denom;  // yx
+               alpha[4] = ( 1.0       + eps*eps*By*By) / denom;  // yy
+               alpha[5] = (-eps*(-Bx) + eps*eps*By*Bz) / denom;  // yz
+               alpha[6] = (-eps*(-By) + eps*eps*Bz*Bx) / denom;  // zx
+               alpha[7] = (-eps*( Bx) + eps*eps*Bz*By) / denom;  // zy
+               alpha[8] = ( 1.0       + eps*eps*Bz*Bz) / denom;  // zz
+
+               // mu += (q_s/m_s) * rho_s^k * alpha_s   (Eq. 36)
+               for (int t = 0; t < 9; ++t) { mu[t] += qOverM_rho * alpha[t]; }
+            }
 
             // J-hat += alpha_s . J_s^{k*}   (Eq. 35)
             jhat[0] += alpha[0]*Jx + alpha[1]*Jy + alpha[2]*Jz;
@@ -401,6 +457,21 @@ void lccl_BuildSpeciesTensors(
    // mu is read at neighbouring nodes by the Gauss-correction operator
    fsgrid.updateGhostCells(outMu.view());
    fsgrid.updateGhostCells(outJhat.view());
+
+   if (P::lcclMatchedCurrent) {
+      // Beyond Omega_c dt = pi the symmetric part of Phi/dt turns negative (sin(psi)/psi < 0 across B):
+      // mu is no longer positive definite and the AP property is lost. Warn once.
+      static bool warned = false;
+      int local = gyrationBeyondPi.load() ? 1 : 0, global = 0;
+      MPI_Allreduce(&local, &global, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+      int rank = 0;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+      if (global && !warned && rank == 0) {
+         fprintf(stderr, "lcclBuildSpeciesTensors: WARNING: fieldsolver.matchedCurrent with |q B/m| dt >= pi for some "
+                         "species; mu is no longer positive definite there. Reduce dt.\n");
+      }
+      if (global) { warned = true; }
+   }
 }
 
 /* ============================================================

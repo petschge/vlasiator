@@ -87,6 +87,9 @@ LIBRARY_PREFIX = $(CURDIR)/libraries-$(VLASIATOR_ARCH)
 LIB_PROFILE = -L$(LIBRARY_PREFIX)/lib -lphiprof -lgfortran -Wl,-rpath=$(LIBRARY_PREFIX)/lib
 INC_PROFILE = -isystem $(LIBRARY_PREFIX)/include
 
+INC_HYRPE =
+LIB_HYPRE = -L${PREFIX}/lib -lHYPRE
+
 LIB_VLSV = -L$(LIBRARY_PREFIX)/lib -lvlsv
 INC_VLSV = -I$(LIBRARY_PREFIX)/include
 

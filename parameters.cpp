@@ -147,6 +147,7 @@ bool P::lcclOutflowAbsorbing = false;
 bool P::lcclInflowCharacteristic = false;
 uint P::lcclLowPassFilterOrder = 2;
 bool P::lcclGaussOutflowNeumann = false;
+bool P::lcclMatchedCurrent = false;
 int P::maxSlAccelerationSubcycles = 1;
 Real P::resistivity = 0.0;
 bool P::fieldSolverDiffusiveEterms = true;
@@ -401,6 +402,7 @@ bool P::addParameters() {
    RP::add("fieldsolver.inflowCharacteristic", "LCCL solver: on an x- Maxwellian face impose the incoming characteristics (Ey+c*Bz = c*Bz_file, Ez-c*By = -c*By_file) and take the outgoing ones from the interior, instead of pinning B and E=0", P::lcclInflowCharacteristic);
    RP::add("fieldsolver.lowPassFilterOrder", "LCCL solver: order of the Shapiro low-pass filter (even, >= 2; 2 is the 3-point binomial). Higher orders remove the cell-to-cell mode with less smoothing of longer features", P::lcclLowPassFilterOrder);
    RP::add("fieldsolver.gaussLawOutflowNeumann", "LCCL solver: in the Gauss correction, zero normal gradient of phi at faces into Outflow cells instead of phi = 0, so the potential at an open end floats", P::lcclGaussOutflowNeumann);
+   RP::add("fieldsolver.matchedCurrent", "LCCL solver: predict the current at t^{k+theta} with the exact Lorentz push over dt that the Vlasov acceleration performs, J^{k+theta} = (1-theta) J* + theta J^{k+1}, instead of the implicit push of Liu et al. (alpha_s). Removes the instability of theta = 0.5 at large Omega_c dt; requires Omega_c dt < pi for every species", P::lcclMatchedCurrent);
    RP::add("fieldsolver.resistivity", "Resistivity for the eta*J term in Ohm's law.", P::resistivity);
    RP::add("fieldsolver.diffusiveEterms", "Enable diffusive terms in the computation of E", P::fieldSolverDiffusiveEterms);
    RP::add("fieldsolver.finiteDifferencingAtBoundaries", "Enable finite differencing at sysboundaries", P::fieldSolverFiniteDifferencingAtBoundaries);

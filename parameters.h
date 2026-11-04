@@ -149,6 +149,7 @@ struct Parameters {
    static bool lcclInflowCharacteristic; /*!< LCCL solver: incident-wave (characteristic) condition on an x- Maxwellian face. */
    static uint lcclLowPassFilterOrder;   /*!< LCCL solver: order (even, >= 2) of the Shapiro low-pass filter. */
    static bool lcclGaussOutflowNeumann;  /*!< LCCL solver: floating phi at faces into Outflow cells in the Gauss correction. */
+   static bool lcclMatchedCurrent;       /*!< LCCL solver: predict J^{k+theta} with the exact Lorentz push the acceleration performs. */
    static Real resistivity;             /*!< Resistivity in Ohm's law eta*J term. */
    static uint ohmHallTerm; /*!< Enable/choose spatial order of Hall term in Ohm's law JXB term. 0: off, 1: 1st spatial
                                order, 2: 2nd spatial order. */
