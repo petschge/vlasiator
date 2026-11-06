@@ -1,4 +1,5 @@
 #include "lccl_electric_field.hpp"
+#include "lccl_restart.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -207,9 +208,11 @@ static void lccl_NodesToYee(std::span<const ApVec3> Bn, std::span<const ApVec3> 
    fsgrid.updateGhostCells(eOut);
 }
 
-// The persistent state is created (and filled from the Yee arrays) on first use
-// and whenever the dt==0 setup call is made, which covers fresh starts (project
-// initial conditions) and restarts (first real step).
+// The persistent state is filled from the Yee arrays by the dt==0 setup call of a fresh start (the
+// project's initial conditions are given on the Yee lattice). A restart installs it from the restart
+// file instead (lccl_RestoreNodeState, called by readGrid), because rebuilding it from the averaged Yee
+// arrays smooths it; only a restart file without the node-centred fields falls back to the Yee arrays,
+// on the first real step.
 static ApNodeState& lccl_GetNodeState(fsgrids::perbspan perb, fsgrids::efieldspan e,
                                     fsgrids::technicalspan technical, FieldSolverGrid& fsgrid,
                                     bool forceRebuild) {
@@ -218,6 +221,37 @@ static ApNodeState& lccl_GetNodeState(fsgrids::perbspan perb, fsgrids::efieldspa
       lccl_YeeToNodes(perb, e, lcclNodeState->B.view(), lcclNodeState->E.view(), technical, fsgrid);
    }
    return *lcclNodeState;
+}
+
+// ---- restart support (lccl_restart.hpp) ----
+bool lccl_HasNodeState() {
+   return static_cast<bool>(lcclNodeState);
+}
+
+std::span<const std::array<Real,3>> lccl_NodeStateE() {
+   if (!lcclNodeState) { return {}; }
+   return lcclNodeState->E.view();
+}
+
+std::span<const std::array<Real,3>> lccl_NodeStateB() {
+   if (!lcclNodeState) { return {}; }
+   return lcclNodeState->B.view();
+}
+
+void lccl_RestoreNodeState(std::span<const std::array<Real,3>> B, std::span<const std::array<Real,3>> E,
+                           FieldSolverGrid& fsgrid) {
+   const size_t nStorage = fsgrid.getNumStorageCells();
+   if (B.size() != nStorage || E.size() != nStorage) {
+      bailout(true, "lccl_RestoreNodeState: arrays do not match the field solver grid", __FILE__, __LINE__);
+      return;
+   }
+   lcclNodeState = std::make_unique<ApNodeState>(nStorage);
+   auto Bv = lcclNodeState->B.view();
+   auto Ev = lcclNodeState->E.view();
+   std::copy(B.begin(), B.end(), Bv.begin());
+   std::copy(E.begin(), E.end(), Ev.begin());
+   fsgrid.updateGhostCells(Bv);
+   fsgrid.updateGhostCells(Ev);
 }
 
 // Write the fields the Vlasov push will use straight into the volume-averaged

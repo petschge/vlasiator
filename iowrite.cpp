@@ -52,6 +52,9 @@
 #include "velocity_mesh_parameters.h"
 #include "sysboundary/ionosphere.h"
 #include "fieldtracing/fieldtracing.h"
+#ifdef FS_LCCL
+#include "fieldsolver/lccl_restart.hpp"
+#endif
 
 using namespace std;
 using namespace vlsv;
@@ -2278,6 +2281,33 @@ bool writeRestart(
                                         });
       return retval;
    }));
+
+#ifdef FS_LCCL
+   // The LCCL solver's node-centred E^k and perturbed B^k (lccl_restart.hpp): fg_E and fg_PERB above are
+   // only their averages onto the Yee lattice, from which the node values cannot be recovered exactly.
+   if (P::fieldSolverMethod == "LCCL" && lccl_HasNodeState()) {
+      const auto nodeReducer = [](bool electric) {
+         return [electric](const FieldSolverData& fieldSolverData) -> std::vector<Real> {
+            const auto* localSize = &fieldSolverData.fsgrid.getLocalSize()[0];
+            std::vector<Real> retval(localSize[0] * localSize[1] * localSize[2] * 3);
+            const auto node = electric ? lccl_NodeStateE() : lccl_NodeStateB();
+            fieldSolverData.fsgrid.serial_for([](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+                                              phiprof::initializeTimer(electric ? "DRO_fg_LCCL_E" : "DRO_fg_LCCL_PERB"),
+                                              fieldSolverData.technical,
+                                              [=, &retval](const fsgrid::Coordinates coordinates, const fsgrid::FsStencil& stencil, cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+                                                 const auto lid = stencil.ooo();
+                                                 const auto ri = localSize[1] * localSize[0] * stencil.k + localSize[0] * stencil.j + stencil.i;
+                                                 retval[3 * ri] = node[lid][0];
+                                                 retval[3 * ri + 1] = node[lid][1];
+                                                 retval[3 * ri + 2] = node[lid][2];
+                                              });
+            return retval;
+         };
+      };
+      restartReducer.addOperator(new DRO::DataReductionOperatorFsGrid("fg_LCCL_E", nodeReducer(true)));
+      restartReducer.addOperator(new DRO::DataReductionOperatorFsGrid("fg_LCCL_PERB", nodeReducer(false)));
+   }
+#endif
 
    // Add ionosphere restart variables
    // (To reconstruct state, we need the time-smoothed downmapped quantities: FACs, rhon and pressure.

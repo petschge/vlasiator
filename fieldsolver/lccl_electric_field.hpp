@@ -21,9 +21,11 @@
  * node-centered fields to produce face center B fields (perb at time level k+1
  * and perbdt2) and edge centered E fields (e at time k+1 and edt2). B_c sits
  * on the face between cell i-1 and i along c; E_c sits on the edge shared by
- * the 4 cells at offsets {0,-1} along the two axes other than c. For
- * initialization and restart we have to do to averaging to get node-centered
- * state from perb and e from the restart files.
+ * the 4 cells at offsets {0,-1} along the two axes other than c. A fresh start
+ * builds the node-centred state from the project's perb and e by averaging.
+ * Restart files store the node-centred state itself (fg_LCCL_E, fg_LCCL_PERB;
+ * see lccl_restart.hpp), so a restarted run continues exactly; only restart
+ * files without these variables fall back to averaging fg_PERB and fg_E.
  *
  * The solver is using second-order centered differences. The same centred curl
  * is used for Faraday (Eq. 23) and Ampere (curl B^k in Eq. 38), and curl-curl

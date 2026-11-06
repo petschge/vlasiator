@@ -52,6 +52,9 @@
 #include "object_wrapper.h"
 #include "velocity_mesh_parameters.h"
 #include "grid.h"
+#ifdef FS_LCCL
+#include "fieldsolver/lccl_restart.hpp"
+#endif
 
 using namespace std;
 using namespace phiprof;
@@ -1897,6 +1900,31 @@ bool exec_readGrid(dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mpiGrid
       success = readFsGridVariable(file, "fg_E", fsgridInputRanks, technical, fsgrid, e);
    }
    exitOnError(success, "(RESTART) Failure reading fsgrid restart variables", MPI_COMM_WORLD);
+#ifdef FS_LCCL
+   if (P::fieldSolverMethod == "LCCL") {
+      // The LCCL solver's node-centred E^k and perturbed B^k (lccl_restart.hpp). Without them the solver
+      // rebuilds its state from fg_PERB and fg_E on the first step, which smooths the fields.
+      list<pair<string, string>> lcclAttribs;
+      lcclAttribs.push_back(make_pair("name", "fg_LCCL_E"));
+      lcclAttribs.push_back(make_pair("mesh", "fsgrid"));
+      uint64_t lcclArraySize, lcclVectorSize, lcclByteSize;
+      vlsv::datatype::type lcclDataType;
+      if (file.getArrayInfo("VARIABLE", lcclAttribs, lcclArraySize, lcclVectorSize, lcclDataType, lcclByteSize)) {
+         fsgrid::FsData<std::array<Real, 3>> nodeB(fsgrid.getNumStorageCells());
+         fsgrid::FsData<std::array<Real, 3>> nodeE(fsgrid.getNumStorageCells());
+         bool lcclSuccess = readFsGridVariable(file, "fg_LCCL_PERB", fsgridInputRanks, technical, fsgrid, nodeB.view());
+         if (lcclSuccess) {
+            lcclSuccess = readFsGridVariable(file, "fg_LCCL_E", fsgridInputRanks, technical, fsgrid, nodeE.view());
+         }
+         exitOnError(lcclSuccess, "(RESTART) Failure reading the LCCL node-centred fields", MPI_COMM_WORLD);
+         lccl_RestoreNodeState(nodeB.view(), nodeE.view(), fsgrid);
+         logFile << "(RESTART) LCCL: node-centred E and B restored from fg_LCCL_E and fg_LCCL_PERB" << endl << write;
+      } else {
+         logFile << "(RESTART) LCCL: the restart file has no node-centred fields (fg_LCCL_E, fg_LCCL_PERB); "
+                 << "they are rebuilt from fg_PERB and fg_E, which smooths them" << endl << write;
+      }
+   }
+#endif
    readfsTimer.stop();
 
    phiprof::Timer readIonosphereTimer{"readIonosphere"};
