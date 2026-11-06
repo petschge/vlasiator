@@ -109,7 +109,7 @@ def main():
         ax[0].semilogy(t, gd_max, "--", label="max, consistent")
         ax[0].set_ylabel(r"$|\rho/\epsilon_0-\nabla\cdot E|$ / scale")
         ax[0].legend(fontsize=8)
-        ax[1].semilogy(t, np.maximum(divb, 1e-300))
+        ax[1].semilogy(t, np.where(divb > 0, divb, np.nan))   # zero (exactly div-free) is left out
         ax[1].set_ylabel(r"max$|\nabla\cdot B|\,\Delta x$/max$|B|$")
         ax[2].plot(t, dw)
         ax[2].set_ylabel(r"$\Delta W_{EM}/W_{EM}(0)$")
