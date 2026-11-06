@@ -501,8 +501,12 @@ void calculateAcceleration(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& 
 
       // Accelerate all particle species
       for (uint popID=0; popID<getObjectWrapper().particleSpecies.size(); ++popID) {
+         // per species, with the velocity blocks times their subcycles as work units, so that the
+         // cost per block-substep and the subcycling of each species can be read from the timer report
+         phiprof::Timer accPopTimer {"accelerate " + getObjectWrapper().particleSpecies[popID].name};
          int maxSubcycles=0;
          int globalMaxSubcycles;
+         double blockSubsteps = 0.0;
 
          // Set active population
          SpatialCell::setCommunicatedSpecies(popID);
@@ -512,7 +516,7 @@ void calculateAcceleration(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& 
          // volume) do not need to be propagated:
          phiprof::Timer gatherTimer {"Gather subcycles and propagated cells"};
          vector<CellID> acceleratedCells;
-         #pragma omp parallel for
+         #pragma omp parallel for reduction(max:maxSubcycles) reduction(+:blockSubsteps)
          for (size_t c=0; c<cells.size(); ++c) {
             SpatialCell* SC = mpiGrid[cells[c]];
             const vmesh::VelocityMesh* vmesh = SC->get_velocity_mesh(popID);
@@ -536,6 +540,7 @@ void calculateAcceleration(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& 
                maxSubcycles = max((int)getAccelerationSubcycles(SC, dt, popID), maxSubcycles);
                spatial_cell::Population& pop = SC->get_population(popID);
                pop.ACCSUBCYCLES = getAccelerationSubcycles(SC, dt, popID);
+               blockSubsteps += (double)blockCount*(double)pop.ACCSUBCYCLES;
             }
          }
          gatherTimer.stop();
@@ -562,6 +567,7 @@ void calculateAcceleration(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& 
 
          // final adjust for all cells, also updating full remote block lists
          adjustVelocityBlocks(mpiGrid, cells, true, popID);
+         accPopTimer.stop(blockSubsteps, "block-substeps");
       } // for-loop over particle species
    }
 

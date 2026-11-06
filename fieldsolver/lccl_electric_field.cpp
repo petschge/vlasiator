@@ -720,9 +720,11 @@ bool lccl_SolveElectricField(
          }
       });
 
+   phiprof::Timer rmeHypreAssembleTimer {"LCCL: RME HYPRE assemble"};
    HYPRE_IJMatrixAssemble(Aij);
    HYPRE_IJVectorAssemble(bij);
    HYPRE_IJVectorAssemble(xij);
+   rmeHypreAssembleTimer.stop();
 
    HYPRE_ParCSRMatrix Apar; HYPRE_IJMatrixGetObject(Aij, (void**)&Apar);
    HYPRE_ParVector bpar; HYPRE_IJVectorGetObject(bij, (void**)&bpar);
@@ -743,12 +745,16 @@ bool lccl_SolveElectricField(
    HYPRE_GMRESSetPrecond(gmres, (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
                           (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup, amg);
 
+   phiprof::Timer rmeSetupTimer {"LCCL: RME BoomerAMG/GMRES setup"};
    HYPRE_ParCSRGMRESSetup(gmres, Apar, bpar, xpar);
+   rmeSetupTimer.stop();
+   phiprof::Timer rmeSolveTimer {"LCCL: RME GMRES solve"};
    HYPRE_ParCSRGMRESSolve(gmres, Apar, bpar, xpar);
 
    HYPRE_Int its = 0; HYPRE_Real relres = 0.0;
    HYPRE_GMRESGetNumIterations(gmres, &its);
    HYPRE_GMRESGetFinalRelativeResidualNorm(gmres, &relres);
+   rmeSolveTimer.stop((double)its, "GMRES iterations");
    if (myRank == MASTER_RANK) {
       fprintf(stderr, "lcclSolveElectricField: GMRES/BoomerAMG finished, relres=%e after %d iters\n", (double)relres, (int)its);
    }
@@ -1506,9 +1512,11 @@ void lccl_GaussLawCorrection(
          HYPRE_IJVectorSetValues(xij, 1, &row, &x0);
       });
 
+   phiprof::Timer gaussHypreAssembleTimer {"LCCL: Gauss HYPRE assemble"};
    HYPRE_IJMatrixAssemble(Aij);
    HYPRE_IJVectorAssemble(bij);
    HYPRE_IJVectorAssemble(xij);
+   gaussHypreAssembleTimer.stop();
 
    HYPRE_ParCSRMatrix Apar; HYPRE_IJMatrixGetObject(Aij, (void**)&Apar);
    HYPRE_ParVector bpar; HYPRE_IJVectorGetObject(bij, (void**)&bpar);
@@ -1528,13 +1536,17 @@ void lccl_GaussLawCorrection(
    HYPRE_PCGSetPrecond(pcgSolver, (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
                         (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup, amgPrecond);
 
+   phiprof::Timer gaussSetupTimer {"LCCL: Gauss BoomerAMG/PCG setup"};
    HYPRE_ParCSRPCGSetup(pcgSolver, Apar, bpar, xpar);
+   gaussSetupTimer.stop();
+   phiprof::Timer gaussSolveTimer {"LCCL: Gauss PCG solve"};
    HYPRE_ParCSRPCGSolve(pcgSolver, Apar, bpar, xpar);
 
    HYPRE_Int pcgIts = 0; HYPRE_Real pcgRelres = 0.0;
    {
       HYPRE_PCGGetNumIterations(pcgSolver, &pcgIts);
       HYPRE_PCGGetFinalRelativeResidualNorm(pcgSolver, &pcgRelres);
+      gaussSolveTimer.stop((double)pcgIts, "PCG iterations");
       if (myRank == MASTER_RANK) {
          fprintf(stderr, "lcclGaussLawCorrection: Hypre PCG/BoomerAMG finished with relative residual %e "
                          "after %d iterations\n", (double)pcgRelres, (int)pcgIts);
@@ -1820,7 +1832,9 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    const size_t nStorage = fsgrid.getNumStorageCells();
    fsgrid::FsData<std::array<Real,9>> mu(nStorage);
    ApNodeField Jhat(nStorage);
+   phiprof::Timer tensorsTimer {"LCCL: species tensors"};
    lccl_BuildSpeciesTensors(speciesRhoQ, speciesJ, state.B.view(), bgb, technical, fsgrid, theta, dt, mu, Jhat);
+   tensorsTimer.stop();
 
    if (P::lcclInflowCharacteristic) {
       lccl_PrepareInflowCharacteristic(state.E.view(), state.B.view(), perb, bgb, technical, fsgrid,
@@ -1831,9 +1845,11 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
 
    // Step (2b): E^{k+theta} from Eq. (38), E^{k+1} from Eq. (40)
    ApNodeField Etheta(nStorage), Ekp1(nStorage), Btheta(nStorage), Bkp1(nStorage);
+   phiprof::Timer rmeTimer {"LCCL: RME (Eq. 38)"};
    const bool converged = lccl_SolveElectricField(state.E.view(), state.B.view(), bgb, mu.view(), Jhat.view(),
                                                 Etheta.view(), Ekp1.view(), technical, fsgrid, sysBoundaries,
                                                 c, theta, dt);
+   rmeTimer.stop();
    lccl_ReportFieldMagnitude("lccl_propagateFields: after raw solve (E^{k+theta})", Etheta.view(), technical, fsgrid);
 
    if (P::lcclLowPassFilter) {
@@ -1842,12 +1858,15 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    }
 
    // Step (2c): B^{k+1} from Eq. (23), B^{k+theta} from Eq. (39)
+   phiprof::Timer faradayTimer {"LCCL: Faraday (Eq. 23)"};
    lccl_UpdateMagneticField(state.B.view(), Etheta.view(), Bkp1.view(), Btheta.view(), bgb, technical, fsgrid,
                           sysBoundaries, theta, dt);
+   faradayTimer.stop();
 
    // Step (2d): Gauss correction of E^{k+1} only. rho^k is the total charge density
    // at the start of the step, the same speciesRhoQ that defines mu (Eq. 36).
    if (P::lcclEnforceGaussLaw) {
+      phiprof::Timer gaussTimer {"LCCL: Gauss correction"};
       fsgrid::FsData<std::array<Real,1>> rho(nStorage);
       fsgrid.parallel_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
@@ -1863,6 +1882,7 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
             rho[lid][0] = sum;
          });
       lccl_GaussLawCorrection(Ekp1.view(), state.E.view(), rho.view(), mu.view(), technical, fsgrid, dt);
+      gaussTimer.stop();
    }
 
    if (P::lcclLowPassFilter) {
