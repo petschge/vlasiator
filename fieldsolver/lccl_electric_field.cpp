@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -1815,6 +1816,104 @@ static void lccl_ApplyLowPassFilter3D(std::span<ApVec3> field, fsgrids::technica
  * Section 7: propagateFields entry point
  * ============================================================ */
 
+/* ============================================================
+ * Section 6b: conservation diagnostics (fieldsolver.diagnosticInterval)
+ * ============================================================
+ * At the start of a step (time level k: the node-centred E^k and perturbed B^k that the solver
+ * carries, and rho^k of all species), over the interior (NOT_SYSBOUNDARY) cells:
+ *  - Gauss residual r = rho/eps0 - div E, with the centred divergence of Eq. 45 and with the
+ *    consistent divergence D = K Q(delta^2) (fieldsolver.gaussLawOrder terms): rms and max |r|;
+ *  - charge-density scale max_cells sum_s |rho_s|/eps0, to normalise the residual (rho itself
+ *    is nearly zero in a quasi-neutral plasma);
+ *  - max |div B| of the cell-centred perturbed B with centred differences (the divergence the
+ *    scheme preserves; the background field is not included), absolute and times the smallest
+ *    active cell size over max |B| (background included);
+ *  - field energies W_E = sum eps0 |E|^2/2 dV and W_B = sum |B0 + dB|^2/(2 mu0) dV, and their sum.
+ * Rank 0 appends one line to lccl_diagnostics.txt (a header is written when the file is new, so a
+ * restarted run continues the same file). The particle kinetic energy is not part of this. */
+static void lccl_WriteDiagnostics(std::span<const ApVec3> E, std::span<const ApVec3> B, fsgrids::constbgbspan bgb,
+                                  const std::vector<fsgrids::speciesrhoqspan>& speciesRhoQ,
+                                  fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   int myRank;
+   MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
+   const size_t nStorage = fsgrid.getNumStorageCells();
+   const auto dxyz = fsgrid.getGridSpacing();
+   const auto globalSize = fsgrid.getGlobalSize();
+   const std::array<bool,3> activeAxis = {globalSize[0] > 1, globalSize[1] > 1, globalSize[2] > 1};
+   const Real dV = dxyz[0]*dxyz[1]*dxyz[2];
+   Real dxMin = std::numeric_limits<Real>::max();
+   for (int c = 0; c < 3; ++c) { if (activeAxis[c]) { dxMin = std::min(dxMin, (Real)dxyz[c]); } }
+   if (dxMin == std::numeric_limits<Real>::max()) { dxMin = dxyz[0]; }
+
+   ApNodeField QE(nStorage);
+   lccl_SeriesQAllAxes(E, QE, P::lcclGaussOrder, activeAxis, technical, fsgrid);
+   const auto qv = QE.view();
+
+   // sums: cells, sum r_c^2, sum r_D^2, W_E, W_B;  maxima: |r_c|, |r_D|, rho scale, |div B|, |B|
+   double sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+   double maxs[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+   fsgrid.serial_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("LCCL: diagnostics"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
+         const size_t lid = stencil.ooo();
+         Real rho = 0.0, rhoAbs = 0.0;
+         for (size_t popID = 0; popID < speciesRhoQ.size(); ++popID) {
+            const Real r = speciesRhoQ[popID][lid][fsgrids::speciesrhoq::SRHOQ];
+            rho += r;
+            rhoAbs += std::fabs(r);
+         }
+         Real divEc = 0.0, divED = 0.0, divB = 0.0;
+         for (int c = 0; c < 3; ++c) {
+            if (!activeAxis[c]) { continue; }
+            std::array<int,3> o{0,0,0}; o[c] = 1;
+            if (!stencil.cellExists(o[0], o[1], o[2]) || !stencil.cellExists(-o[0], -o[1], -o[2])) { continue; }
+            const size_t p = stencil.indexFromOffset(o[0], o[1], o[2]);
+            const size_t m = stencil.indexFromOffset(-o[0], -o[1], -o[2]);
+            divEc += (E[p][c] - E[m][c])/(2.0*dxyz[c]);
+            divED += (qv[p][c] - qv[m][c])/(2.0*dxyz[c]);
+            divB  += (B[p][c] - B[m][c])/(2.0*dxyz[c]);
+         }
+         const Real rc = rho/physicalconstants::EPS_0 - divEc;
+         const Real rD = rho/physicalconstants::EPS_0 - divED;
+         Real E2 = 0.0, B2 = 0.0;
+         for (int c = 0; c < 3; ++c) {
+            const Real Bt = B[lid][c] + bgb[lid][kBgbVol[c]];
+            E2 += E[lid][c]*E[lid][c];
+            B2 += Bt*Bt;
+         }
+         sums[0] += 1.0;
+         sums[1] += rc*rc;
+         sums[2] += rD*rD;
+         sums[3] += 0.5*physicalconstants::EPS_0*E2*dV;
+         sums[4] += 0.5*B2*dV/physicalconstants::MU_0;
+         maxs[0] = std::max(maxs[0], (double)std::fabs(rc));
+         maxs[1] = std::max(maxs[1], (double)std::fabs(rD));
+         maxs[2] = std::max(maxs[2], (double)(rhoAbs/physicalconstants::EPS_0));
+         maxs[3] = std::max(maxs[3], (double)std::fabs(divB));
+         maxs[4] = std::max(maxs[4], (double)std::sqrt(B2));
+      });
+   double gsums[5], gmaxs[5];
+   MPI_Allreduce(sums, gsums, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   MPI_Allreduce(maxs, gmaxs, 5, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+   if (myRank != MASTER_RANK) { return; }
+   FILE* f = fopen("lccl_diagnostics.txt", "a");
+   if (f == nullptr) { return; }
+   if (ftell(f) == 0) {
+      fprintf(f, "# LCCL conservation diagnostics at the start of the step (time level k), interior cells\n"
+                 "# 1 step  2 time [s]  3 rms(rho/eps0 - div_c E) [V/m^2]  4 max|rho/eps0 - div_c E|  "
+                 "5 rms(rho/eps0 - D.E) (consistent divergence)  6 max|rho/eps0 - D.E|  7 max sum_s|rho_s|/eps0 [V/m^2]  "
+                 "8 max|div_c B| [T/m]  9 max|div_c B| dx_min / max|B|  10 W_E [J]  11 W_B [J]  12 W_E + W_B [J]\n");
+   }
+   const double n = std::max(gsums[0], 1.0);
+   fprintf(f, "%u %.12e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.12e %.12e %.12e\n",
+           (unsigned)P::tstep, (double)P::t, std::sqrt(gsums[1]/n), gmaxs[0], std::sqrt(gsums[2]/n), gmaxs[1], gmaxs[2],
+           gmaxs[3], gmaxs[4] > 0.0 ? gmaxs[3]*dxMin/gmaxs[4] : 0.0, gsums[3], gsums[4], gsums[3] + gsums[4]);
+   fclose(f);
+}
+
 bool lccl_propagateFields(fsgrids::perbspan perb,
                      fsgrids::perbspan perbdt2,
                      fsgrids::efieldspan e,
@@ -1873,6 +1972,12 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    }
 
    if (!lccl_CheckSolverOptions()) { return false; }
+
+   if (P::lcclDiagnosticInterval > 0 && (P::tstep % P::lcclDiagnosticInterval) == 0) {
+      fsgrid.updateGhostCells(state.E.view());
+      fsgrid.updateGhostCells(state.B.view());
+      lccl_WriteDiagnostics(state.E.view(), state.B.view(), bgb, speciesRhoQ, technical, fsgrid);
+   }
 
    const size_t nStorage = fsgrid.getNumStorageCells();
    fsgrid::FsData<std::array<Real,9>> mu(nStorage);

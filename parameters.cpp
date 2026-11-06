@@ -171,6 +171,7 @@ int P::lcclAMGAggressiveLevels = -1;
 int P::lcclHyprePrintLevel = 0;
 bool P::lcclSolverFailBailout = false;
 uint P::lcclSolverReportInterval = 1;
+uint P::lcclDiagnosticInterval = 0;
 int P::maxSlAccelerationSubcycles = 1;
 Real P::resistivity = 0.0;
 bool P::fieldSolverDiffusiveEterms = true;
@@ -449,6 +450,7 @@ bool P::addParameters() {
    RP::add("fieldsolver.hyprePrintLevel", "LCCL solver: HYPRE print level of the Krylov solvers and of BoomerAMG (0: silent)", P::lcclHyprePrintLevel);
    RP::add("fieldsolver.solverFailBailout", "LCCL solver: stop the run (bailout) when a solve fails, see fieldsolver.rmeFailRelres and fieldsolver.gaussLawFailRelres", P::lcclSolverFailBailout);
    RP::add("fieldsolver.solverReportInterval", "LCCL solver: steps between the lines that report iterations and residuals of both solves on rank 0 (1: every step; 0: only failures). The phiprof report has iterations and times in any case", P::lcclSolverReportInterval);
+   RP::add("fieldsolver.diagnosticInterval", "LCCL solver: every this many steps, rank 0 appends a line to lccl_diagnostics.txt with the Gauss residual rho/eps0 - div E (centred and consistent divergence; rms and max), the charge-density scale, max |div B| (centred, of the cell-centred B that the solver advances) and the electric, magnetic and total field energy, all at the start of the step (time level k) over the interior cells. 0: off", P::lcclDiagnosticInterval);
    RP::add("fieldsolver.resistivity", "Resistivity for the eta*J term in Ohm's law.", P::resistivity);
    RP::add("fieldsolver.diffusiveEterms", "Enable diffusive terms in the computation of E", P::fieldSolverDiffusiveEterms);
    RP::add("fieldsolver.finiteDifferencingAtBoundaries", "Enable finite differencing at sysboundaries", P::fieldSolverFiniteDifferencingAtBoundaries);

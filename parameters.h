@@ -173,6 +173,7 @@ struct Parameters {
    static int lcclHyprePrintLevel;       /*!< LCCL solver: HYPRE print level of the Krylov solvers and BoomerAMG. */
    static bool lcclSolverFailBailout;    /*!< LCCL solver: stop the run (bailout) when a solve fails. */
    static uint lcclSolverReportInterval; /*!< LCCL solver: steps between the solver report lines (0: only failures). */
+   static uint lcclDiagnosticInterval;   /*!< LCCL solver: steps between lines of lccl_diagnostics.txt (Gauss residual, div B, field energy; 0: off). */
    static Real resistivity;             /*!< Resistivity in Ohm's law eta*J term. */
    static uint ohmHallTerm; /*!< Enable/choose spatial order of Hall term in Ohm's law JXB term. 0: off, 1: 1st spatial
                                order, 2: 2nd spatial order. */
