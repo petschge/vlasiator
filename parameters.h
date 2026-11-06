@@ -174,6 +174,7 @@ struct Parameters {
    static bool lcclSolverFailBailout;    /*!< LCCL solver: stop the run (bailout) when a solve fails. */
    static uint lcclSolverReportInterval; /*!< LCCL solver: steps between the solver report lines (0: only failures). */
    static uint lcclDiagnosticInterval;   /*!< LCCL solver: steps between lines of lccl_diagnostics.txt (Gauss residual, div B, field energy; 0: off). */
+   static bool lcclEnergyAccounting;     /*!< LCCL solver: energy budget of every step (kinetic energies, field terms) in lccl_diagnostics.txt. */
    static Real resistivity;             /*!< Resistivity in Ohm's law eta*J term. */
    static uint ohmHallTerm; /*!< Enable/choose spatial order of Hall term in Ohm's law JXB term. 0: off, 1: 1st spatial
                                order, 2: 2nd spatial order. */

@@ -83,6 +83,11 @@ void calculateInterpolatedVelocityMoments(
 */
 void calculateInitialVelocityMoments(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid);
 
+/*! Kinetic energy of every species, sum over the interior (NOT_SYSBOUNDARY) local cells of
+ *  1/2 m sum_v f v^2 dv^3 dV, summed over all ranks (energy accounting of the LCCL solver). */
+void lcclKineticEnergies(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
+                         const std::vector<CellID>& cells, std::vector<double>& K);
+
 
 
 #endif

@@ -42,6 +42,7 @@
 #include <fsgrid.hpp>
 
 #include "vlasovsolver/vlasovmover.h"
+#include "vlasovsolver/lccl_energy_budget.h"
 #include "vlasovsolver/vec.h"
 #include "definitions.h"
 #include "mpiconversion.h"
@@ -1023,6 +1024,15 @@ int simulate(int argn,char* args[]) {
 
    addTimedBarrier("barrier-end-initialization");
 
+#ifdef FS_LCCL
+   // Energy accounting of the LCCL cycle (fieldsolver.energyAccounting, lccl_energy_budget.h)
+   if (fieldSolverIsLCCL && P::lcclEnergyAccounting) {
+      LcclEnergyBudget& budget = lcclEnergyBudget();
+      budget.active = true;
+      budget.haveK = false;
+      budget.resize(getObjectWrapper().particleSpecies.size());
+   }
+#endif
    phiprof::Timer simulationTimer {"Simulation"};
    double startTime=  MPI_Wtime();
    double beforeTime = MPI_Wtime();
@@ -1428,6 +1438,14 @@ int simulate(int argn,char* args[]) {
          // still holds exactly f^k, left over from last iteration's closing
          // (1-FieldSolverTheta)*dt translation
          captureSpeciesChargeDensity(mpiGrid, cells, speciesRhoQ_k);
+         // Energy accounting: kinetic energies at the start of the first step; later steps start
+         // with those measured at the end of the previous one
+         LcclEnergyBudget& budget = lcclEnergyBudget();
+         if (budget.active && !budget.haveK) {
+            phiprof::Timer accountTimer {"LCCL energy accounting"};
+            lcclKineticEnergies(mpiGrid, cells, budget.K);
+            budget.haveK = true;
+         }
       }
 #endif
 
@@ -1627,6 +1645,21 @@ int simulate(int argn,char* args[]) {
             sysBoundaryContainer.applySysBoundaryVlasovConditions(mpiGrid, P::t + 0.5 * P::dt, false);
             timer.stop();
             addTimedBarrier("barrier-boundary-conditions");
+         }
+
+         // Energy accounting: what the step changed outside the acceleration (translations, sparse
+         // mesh, boundaries) is the change over the step minus the change in the acceleration
+         LcclEnergyBudget& budget = lcclEnergyBudget();
+         if (budget.active && budget.haveK) {
+            phiprof::Timer accountTimer {"LCCL energy accounting"};
+            std::vector<double> Knew;
+            lcclKineticEnergies(mpiGrid, cells, Knew);
+            for (size_t popID = 0; popID < Knew.size(); ++popID) {
+               budget.dKtrans[popID] += (Knew[popID] - budget.K[popID])
+                                        - (budget.stepKaccAfter[popID] - budget.stepKaccBefore[popID]);
+               budget.stepKaccBefore[popID] = budget.stepKaccAfter[popID] = 0.0;
+            }
+            budget.K = Knew;
          }
       }
 #endif

@@ -1,5 +1,6 @@
 #include "lccl_electric_field.hpp"
 #include "lccl_restart.hpp"
+#include "../vlasovsolver/lccl_energy_budget.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -527,6 +528,7 @@ static bool lccl_CheckSolverOptions() {
    if (P::lcclRmeKrylovDimension < 1) { fail("fieldsolver.rmeKrylovDimension must be >= 1"); }
    if (P::lcclRmeAMGCycles < 1 || P::lcclGaussAMGCycles < 1) { fail("fieldsolver.rmeAMGCycles and fieldsolver.gaussLawAMGCycles must be >= 1"); }
    if (!(P::lcclRmeFailRelres > 0.0) || !(P::lcclGaussFailRelres > 0.0)) { fail("fieldsolver.rmeFailRelres and fieldsolver.gaussLawFailRelres must be > 0"); }
+   if (P::lcclEnergyAccounting && P::lcclDiagnosticInterval == 0) { fail("fieldsolver.energyAccounting writes to lccl_diagnostics.txt and needs fieldsolver.diagnosticInterval > 0"); }
    return ok;
 }
 
@@ -1816,6 +1818,35 @@ static void lccl_ApplyLowPassFilter3D(std::span<ApVec3> field, fsgrids::technica
  * Section 7: propagateFields entry point
  * ============================================================ */
 
+// Sum of f(lid) over the interior (NOT_SYSBOUNDARY) cells of all ranks (energy accounting)
+template <typename F>
+static double lccl_InteriorSum(fsgrids::technicalspan technical, FieldSolverGrid& fsgrid, F f) {
+   double local = 0.0;
+   fsgrid.serial_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("LCCL: energy accounting sum"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
+         local += f(stencil.ooo());
+      });
+   double global = 0.0;
+   MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   return global;
+}
+
+// eps0 |E|^2/2 + |B0 + dB|^2/(2 mu0) times the cell volume
+static inline double lccl_CellFieldEnergy(const ApVec3& E, const ApVec3& B, const std::array<Real, fsgrids::bgbfield::N_BGB>& bg,
+                                          Real dV) {
+   double e2 = 0.0, b2 = 0.0;
+   for (int c = 0; c < 3; ++c) {
+      const Real Bt = B[c] + bg[kBgbVol[c]];
+      e2 += E[c]*E[c];
+      b2 += Bt*Bt;
+   }
+   return (0.5*physicalconstants::EPS_0*e2 + 0.5*b2/physicalconstants::MU_0)*dV;
+}
+
 /* ============================================================
  * Section 6b: conservation diagnostics (fieldsolver.diagnosticInterval)
  * ============================================================
@@ -1899,18 +1930,39 @@ static void lccl_WriteDiagnostics(std::span<const ApVec3> E, std::span<const ApV
    MPI_Allreduce(sums, gsums, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
    MPI_Allreduce(maxs, gmaxs, 5, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
    if (myRank != MASTER_RANK) { return; }
+   const LcclEnergyBudget& budget = lcclEnergyBudget();
+   const bool withBudget = budget.active && budget.haveK;
    FILE* f = fopen("lccl_diagnostics.txt", "a");
    if (f == nullptr) { return; }
    if (ftell(f) == 0) {
+      // Units: residuals and rho_scale V/m^2, divB_max T/m, divB_rel 1, energies J. The budget columns
+      // (fieldsolver.energyAccounting) are cumulative since the start of this run, see lccl_energy_budget.h.
       fprintf(f, "# LCCL conservation diagnostics at the start of the step (time level k), interior cells\n"
-                 "# 1 step  2 time [s]  3 rms(rho/eps0 - div_c E) [V/m^2]  4 max|rho/eps0 - div_c E|  "
-                 "5 rms(rho/eps0 - D.E) (consistent divergence)  6 max|rho/eps0 - D.E|  7 max sum_s|rho_s|/eps0 [V/m^2]  "
-                 "8 max|div_c B| [T/m]  9 max|div_c B| dx_min / max|B|  10 W_E [J]  11 W_B [J]  12 W_E + W_B [J]\n");
+                 "# columns: step time gauss_centred_rms gauss_centred_max gauss_consistent_rms gauss_consistent_max "
+                 "rho_scale divB_max divB_rel W_E W_B W_EM");
+      if (withBudget) {
+         for (const auto& sp : getObjectWrapper().particleSpecies) { fprintf(f, " K_%s", sp.name.c_str()); }
+         fprintf(f, " K W_total P_pred D_theta dW_corr R_F");
+         for (const auto& sp : getObjectWrapper().particleSpecies) {
+            fprintf(f, " dKacc_%s Wmap_%s dKtrans_%s", sp.name.c_str(), sp.name.c_str(), sp.name.c_str());
+         }
+      }
+      fprintf(f, "\n");
    }
    const double n = std::max(gsums[0], 1.0);
-   fprintf(f, "%u %.12e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.12e %.12e %.12e\n",
+   fprintf(f, "%u %.12e %.6e %.6e %.6e %.6e %.6e %.6e %.6e %.12e %.12e %.12e",
            (unsigned)P::tstep, (double)P::t, std::sqrt(gsums[1]/n), gmaxs[0], std::sqrt(gsums[2]/n), gmaxs[1], gmaxs[2],
            gmaxs[3], gmaxs[4] > 0.0 ? gmaxs[3]*dxMin/gmaxs[4] : 0.0, gsums[3], gsums[4], gsums[3] + gsums[4]);
+   if (withBudget) {
+      double Ksum = 0.0;
+      for (const double k : budget.K) { fprintf(f, " %.12e", k); Ksum += k; }
+      fprintf(f, " %.12e %.12e %.12e %.12e %.12e %.12e", Ksum, gsums[3] + gsums[4] + Ksum,
+              budget.Ppred, budget.Dtheta, budget.dWcorr, budget.RF);
+      for (size_t p = 0; p < budget.K.size(); ++p) {
+         fprintf(f, " %.12e %.12e %.12e", budget.dKacc[p], budget.Wmap[p], budget.dKtrans[p]);
+      }
+   }
+   fprintf(f, "\n");
    fclose(f);
 }
 
@@ -1979,6 +2031,17 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
       lccl_WriteDiagnostics(state.E.view(), state.B.view(), bgb, speciesRhoQ, technical, fsgrid);
    }
 
+   // Energy accounting, field side (fieldsolver.energyAccounting, lccl_energy_budget.h)
+   LcclEnergyBudget& budget = lcclEnergyBudget();
+   const bool account = budget.active;
+   const auto dxyzAcc = fsgrid.getGridSpacing();
+   const Real dVAcc = dxyzAcc[0]*dxyzAcc[1]*dxyzAcc[2];
+   double accWk = 0.0, accPpred = 0.0, accWEraw = 0.0, accdE2 = 0.0, accWBraw = 0.0, accdB2 = 0.0;
+   if (account) {
+      const auto Ek = state.E.view(); const auto Bk = state.B.view();
+      accWk = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) { return lccl_CellFieldEnergy(Ek[lid], Bk[lid], bgb[lid], dVAcc); });
+   }
+
    const size_t nStorage = fsgrid.getNumStorageCells();
    fsgrid::FsData<std::array<Real,9>> mu(nStorage);
    ApNodeField Jhat(nStorage);
@@ -2002,6 +2065,30 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    rmeTimer.stop();
    lccl_ReportFieldMagnitude("lccl_propagateFields: after raw solve (E^{k+theta})", Etheta.view(), technical, fsgrid);
 
+   if (account) {
+      // work of the predicted current J^{k+theta} = J-hat + theta dt mu E^{k+theta} (Eq. 37) on the raw
+      // E^{k+theta}, and the raw E^{k+1}, before any filter or correction
+      const auto Ek = state.E.view(); const auto Et = Etheta.view(); const auto E1 = Ekp1.view();
+      const auto Jh = Jhat.view(); const auto mv = mu.view();
+      accPpred = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) {
+         double w = 0.0;
+         for (int a = 0; a < 3; ++a) {
+            double J = Jh[lid][a];
+            for (int b = 0; b < 3; ++b) { J += theta*dt*mv[lid][a*3 + b]*Et[lid][b]; }
+            w += J*Et[lid][a];
+         }
+         return dt*w*dVAcc;
+      });
+      accWEraw = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) {
+         double e2 = 0.0; for (int a = 0; a < 3; ++a) { e2 += E1[lid][a]*E1[lid][a]; }
+         return 0.5*physicalconstants::EPS_0*e2*dVAcc;
+      });
+      accdE2 = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) {
+         double d2 = 0.0; for (int a = 0; a < 3; ++a) { const double d = E1[lid][a] - Ek[lid][a]; d2 += d*d; }
+         return physicalconstants::EPS_0*d2*dVAcc;
+      });
+   }
+
    if (P::lcclLowPassFilter) {
       lccl_ApplyLowPassFilter3D(Etheta.view(), technical, fsgrid);
       lccl_ApplyLowPassFilter3D(Ekp1.view(), technical, fsgrid);
@@ -2012,6 +2099,20 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    lccl_UpdateMagneticField(state.B.view(), Etheta.view(), Bkp1.view(), Btheta.view(), bgb, technical, fsgrid,
                           sysBoundaries, theta, dt);
    faradayTimer.stop();
+
+   if (account) {
+      // raw B^{k+1} from Faraday, before the Gauss correction and the low-pass filter of B
+      const auto Bk = state.B.view(); const auto B1 = Bkp1.view();
+      accWBraw = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) {
+         double b2 = 0.0;
+         for (int a = 0; a < 3; ++a) { const double Bt = B1[lid][a] + bgb[lid][kBgbVol[a]]; b2 += Bt*Bt; }
+         return 0.5*b2*dVAcc/physicalconstants::MU_0;
+      });
+      accdB2 = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) {
+         double d2 = 0.0; for (int a = 0; a < 3; ++a) { const double d = B1[lid][a] - Bk[lid][a]; d2 += d*d; }
+         return d2*dVAcc/physicalconstants::MU_0;
+      });
+   }
 
    // Step (2d): Gauss correction of E^{k+1} only. rho^k is the total charge density
    // at the start of the step, the same speciesRhoQ that defines mu (Eq. 36).
@@ -2038,6 +2139,19 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    if (P::lcclLowPassFilter) {
       lccl_ApplyLowPassFilter3D(Bkp1.view(), technical, fsgrid);
       lccl_ApplyLowPassFilter3D(Btheta.view(), technical, fsgrid);
+   }
+
+   if (account) {
+      const auto E1 = Ekp1.view(); const auto B1 = Bkp1.view();
+      const double Wfinal = lccl_InteriorSum(technical, fsgrid, [&](size_t lid) {
+         return lccl_CellFieldEnergy(E1[lid], B1[lid], bgb[lid], dVAcc);
+      });
+      const double Wraw = accWEraw + accWBraw;
+      const double Dtheta = (theta - 0.5)*(accdE2 + accdB2);
+      budget.Ppred += accPpred;
+      budget.Dtheta += Dtheta;
+      budget.dWcorr += Wfinal - Wraw;
+      budget.RF += (Wraw - accWk) + accPpred + Dtheta;
    }
 
    // Hand-off to the Vlasov solver (Eq. 20): E^{k+theta}, B^{k+theta} straight into vol.

@@ -40,6 +40,7 @@
 #include "../mpiconversion.h"
 
 #include "arch_moments.h"
+#include "lccl_energy_budget.h"
 
 #include "cpu_trans_pencils.hpp"
 #include "cpu_acc_transform.hpp" // for updateAccelerationMaxdt
@@ -400,6 +401,74 @@ uint getAccelerationSubcycles(const SpatialCell* spatial_cell, const Real dt, co
    return max( convert<uint>(ceil(dt / spatial_cell->get_max_v_dt(popID))), 1u);
 }
 
+// ---- energy accounting of the LCCL solver (lccl_energy_budget.h) ----
+// Particles, mean velocity and kinetic energy of one species in one cell (Sum f, Sum f v, Sum f v^2, all
+// times dv^3 and the cell volume), from the same block sums as the velocity moments.
+static void lcclCellEnergyMoments(SpatialCell* cell, const uint popID, Real& N, Real (&Nu)[3], Real& sumV2) {
+   N = 0.0; Nu[0] = Nu[1] = Nu[2] = 0.0; sumV2 = 0.0;
+   const uint nBlocks = cell->get_velocity_mesh(popID)->size();
+   if (nBlocks == 0) { return; }
+   #ifdef USE_GPU
+   vmesh::VelocityBlockContainer* blockContainer = cell->dev_get_velocity_blocks(popID);
+   #else
+   vmesh::VelocityBlockContainer* blockContainer = cell->get_velocity_blocks(popID);
+   #endif
+   Real first[4] = {0, 0, 0, 0};
+   blockVelocityFirstMoments(blockContainer, first, nBlocks);
+   Real second[6] = {0, 0, 0, 0, 0, 0};
+   blockVelocitySecondMoments(blockContainer, (Real)0.0, (Real)0.0, (Real)0.0, second, nBlocks);
+   const Real dV = cell->parameters[CellParams::DX]*cell->parameters[CellParams::DY]*cell->parameters[CellParams::DZ];
+   N = first[0]*dV;
+   for (int i = 0; i < 3; ++i) { Nu[i] = first[i+1]*dV; }
+   sumV2 = (second[0] + second[1] + second[2])*dV;
+}
+
+void lcclKineticEnergies(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
+                         const std::vector<CellID>& cells, std::vector<double>& K) {
+   const uint nPops = getObjectWrapper().particleSpecies.size();
+   std::vector<double> local(nPops, 0.0);
+   K.assign(nPops, 0.0);
+   for (uint popID = 0; popID < nPops; ++popID) {
+      const Real mass = getObjectWrapper().particleSpecies[popID].mass;
+      double sum = 0.0;
+      #ifndef USE_GPU // on GPUs the block sums launch kernels: one cell at a time
+      #pragma omp parallel for reduction(+:sum)
+      #endif
+      for (size_t c = 0; c < cells.size(); ++c) {
+         SpatialCell* cell = mpiGrid[cells[c]];
+         if (cell->sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { continue; }
+         Real N, Nu[3], sumV2;
+         lcclCellEnergyMoments(cell, popID, N, Nu, sumV2);
+         sum += 0.5*mass*sumV2;
+      }
+      local[popID] = sum;
+   }
+   MPI_Allreduce(local.data(), K.data(), nPops, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+}
+
+// The kinetic-energy change an exact remap of this cell's acceleration would give: the subcycles apply
+// the affine maps v -> A v + b of compute_acceleration_transformation, here composed over the same
+// subcycle lengths as calculateAcceleration uses, and |A v + b|^2 - |v|^2 = 2 b.(A v) + |b|^2 for a
+// rotation A, so the change depends only on the particles and their mean velocity.
+static Real lcclIdealAccelerationEnergy(SpatialCell* cell, const uint popID, const Real dt,
+                                        const Real N, const Real (&Nu)[3]) {
+   if (N <= 0.0) { return 0.0; }
+   const uint nSub = getAccelerationSubcycles(cell, dt, popID);
+   const Real maxVdt = cell->get_max_v_dt(popID);
+   Eigen::Transform<Real,3,Eigen::Affine> total(Eigen::Matrix<Real,4,4>::Identity());
+   for (uint step = 0; step < nSub; ++step) {
+      Real subDt = ((step + 1)*maxVdt > fabs(dt)) ? std::max(fabs(dt) - step*maxVdt, (Real)0.0) : maxVdt;
+      if (dt < 0) { subDt = -subDt; }
+      total = compute_acceleration_transformation(cell, popID, subDt)*total;
+   }
+   const Eigen::Matrix<Real,3,1> u(Nu[0]/N, Nu[1]/N, Nu[2]/N);
+   const Eigen::Matrix<Real,3,1> b = total.translation();
+   const Eigen::Matrix<Real,3,1> Au = total.linear()*u;
+   const Real mass = getObjectWrapper().particleSpecies[popID].mass;
+   return 0.5*mass*N*(2.0*b.dot(Au) + b.squaredNorm());
+}
+
+
 /** Accelerate the given population to new time t+dt.
  * @param popID Particle population ID.
  * @param globalMaxSubcycles Number of times acceleration is subcycled.
@@ -545,6 +614,30 @@ void calculateAcceleration(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& 
          }
          gatherTimer.stop();
 
+         // Energy accounting (fieldsolver.energyAccounting): kinetic energy and the change an exact
+         // remap would give, before the subcycles, over the interior cells that are accelerated
+         LcclEnergyBudget& budget = lcclEnergyBudget();
+         const bool account = budget.active && dt != 0.0;
+         vector<CellID> accountedCells;
+         double accKbefore = 0.0, accWmap = 0.0;
+         if (account) {
+            phiprof::Timer accountTimer {"LCCL energy accounting"};
+            for (const CellID cid : acceleratedCells) {
+               if (mpiGrid[cid]->sysBoundaryFlag == sysboundarytype::NOT_SYSBOUNDARY) { accountedCells.push_back(cid); }
+            }
+            const Real mass = getObjectWrapper().particleSpecies[popID].mass;
+            #ifndef USE_GPU // on GPUs the block sums launch kernels: one cell at a time
+            #pragma omp parallel for reduction(+:accKbefore,accWmap)
+            #endif
+            for (size_t c = 0; c < accountedCells.size(); ++c) {
+               SpatialCell* SC = mpiGrid[accountedCells[c]];
+               Real N, Nu[3], sumV2;
+               lcclCellEnergyMoments(SC, popID, N, Nu, sumV2);
+               accKbefore += 0.5*mass*sumV2;
+               accWmap += lcclIdealAccelerationEnergy(SC, popID, dt, N, Nu);
+            }
+         }
+
          // Compute global maximum for number of subcycles
          MPI_Allreduce(&maxSubcycles, &globalMaxSubcycles, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
@@ -567,6 +660,26 @@ void calculateAcceleration(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& 
 
          // final adjust for all cells, also updating full remote block lists
          adjustVelocityBlocks(mpiGrid, cells, true, popID);
+
+         if (account) {
+            phiprof::Timer accountTimer {"LCCL energy accounting"};
+            const Real mass = getObjectWrapper().particleSpecies[popID].mass;
+            double accKafter = 0.0;
+            #ifndef USE_GPU // on GPUs the block sums launch kernels: one cell at a time
+            #pragma omp parallel for reduction(+:accKafter)
+            #endif
+            for (size_t c = 0; c < accountedCells.size(); ++c) {
+               Real N, Nu[3], sumV2;
+               lcclCellEnergyMoments(mpiGrid[accountedCells[c]], popID, N, Nu, sumV2);
+               accKafter += 0.5*mass*sumV2;
+            }
+            double local[3] = {accKbefore, accKafter, accWmap}, global[3];
+            MPI_Allreduce(local, global, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+            budget.stepKaccBefore[popID] = global[0];
+            budget.stepKaccAfter[popID] = global[1];
+            budget.dKacc[popID] += global[1] - global[0];
+            budget.Wmap[popID] += global[2];
+         }
          accPopTimer.stop(blockSubsteps, "block-substeps");
       } // for-loop over particle species
    }
