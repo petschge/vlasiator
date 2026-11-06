@@ -512,6 +512,40 @@ void lccl_BuildSpeciesTensors(
  * Section 3: Eq. (38) -- HYPRE IJ assembly + BoomerAMG-preconditioned GMRES
  * ============================================================ */
 
+/* Linear-solver settings (run-time options fieldsolver.rme*, gaussLaw*Tolerance/MaxIterations/AMGCycles/
+ * FailRelres, amg*, hyprePrintLevel, solverFailBailout, solverReportInterval). The defaults reproduce the
+ * settings that were hard-coded before: relative tolerance 1e-10, 200 iterations, GMRES restart length 5
+ * (HYPRE's default), one BoomerAMG V-cycle per preconditioner application with HYPRE's AMG defaults. */
+static bool lccl_CheckSolverOptions() {
+   static bool checked = false, ok = true;
+   if (checked) { return ok; }
+   checked = true;
+   const auto fail = [&](const char* what) { bailout(true, what, __FILE__, __LINE__); ok = false; };
+   if (!(P::lcclRmeTolerance > 0.0) || !(P::lcclGaussTolerance > 0.0)) { fail("fieldsolver.rmeTolerance and fieldsolver.gaussLawTolerance must be > 0"); }
+   if (P::lcclRmeMaxIterations < 1 || P::lcclGaussMaxIterations < 1) { fail("fieldsolver.rmeMaxIterations and fieldsolver.gaussLawMaxIterations must be >= 1"); }
+   if (P::lcclRmeKrylovDimension < 1) { fail("fieldsolver.rmeKrylovDimension must be >= 1"); }
+   if (P::lcclRmeAMGCycles < 1 || P::lcclGaussAMGCycles < 1) { fail("fieldsolver.rmeAMGCycles and fieldsolver.gaussLawAMGCycles must be >= 1"); }
+   if (!(P::lcclRmeFailRelres > 0.0) || !(P::lcclGaussFailRelres > 0.0)) { fail("fieldsolver.rmeFailRelres and fieldsolver.gaussLawFailRelres must be > 0"); }
+   return ok;
+}
+
+// BoomerAMG as a preconditioner: fixed number of V-cycles, no own tolerance, options applied where set.
+static void lccl_ConfigureBoomerAMG(HYPRE_Solver amg, uint cycles) {
+   HYPRE_BoomerAMGSetPrintLevel(amg, P::lcclHyprePrintLevel);
+   HYPRE_BoomerAMGSetMaxIter(amg, (HYPRE_Int)cycles);
+   HYPRE_BoomerAMGSetTol(amg, 0.0);
+   if (P::lcclAMGStrongThreshold > 0.0) { HYPRE_BoomerAMGSetStrongThreshold(amg, P::lcclAMGStrongThreshold); }
+   if (P::lcclAMGCoarsenType >= 0)      { HYPRE_BoomerAMGSetCoarsenType(amg, P::lcclAMGCoarsenType); }
+   if (P::lcclAMGRelaxType >= 0)        { HYPRE_BoomerAMGSetRelaxType(amg, P::lcclAMGRelaxType); }
+   if (P::lcclAMGInterpType >= 0)       { HYPRE_BoomerAMGSetInterpType(amg, P::lcclAMGInterpType); }
+   if (P::lcclAMGAggressiveLevels >= 0) { HYPRE_BoomerAMGSetAggNumLevels(amg, P::lcclAMGAggressiveLevels); }
+}
+
+// Report line on rank 0 every fieldsolver.solverReportInterval steps (0: never); failures are always reported.
+static bool lccl_ReportThisStep() {
+   return P::lcclSolverReportInterval > 0 && (P::tstep % P::lcclSolverReportInterval) == 0;
+}
+
 bool lccl_SolveElectricField(
    std::span<const ApVec3> Ek,
    std::span<const ApVec3> Bk,
@@ -734,14 +768,13 @@ bool lccl_SolveElectricField(
    // term makes the reaction block non-symmetric
    HYPRE_Solver amg, gmres;
    HYPRE_BoomerAMGCreate(&amg);
-   HYPRE_BoomerAMGSetPrintLevel(amg, 0);
-   HYPRE_BoomerAMGSetMaxIter(amg, 1);
-   HYPRE_BoomerAMGSetTol(amg, 0.0);
+   lccl_ConfigureBoomerAMG(amg, P::lcclRmeAMGCycles);
 
    HYPRE_ParCSRGMRESCreate(MPI_COMM_WORLD, &gmres);
-   HYPRE_GMRESSetMaxIter(gmres, 200);
-   HYPRE_GMRESSetTol(gmres, 1e-10);
-   HYPRE_GMRESSetPrintLevel(gmres, 0);
+   HYPRE_GMRESSetKDim(gmres, (HYPRE_Int)P::lcclRmeKrylovDimension);
+   HYPRE_GMRESSetMaxIter(gmres, (HYPRE_Int)P::lcclRmeMaxIterations);
+   HYPRE_GMRESSetTol(gmres, P::lcclRmeTolerance);
+   HYPRE_GMRESSetPrintLevel(gmres, P::lcclHyprePrintLevel);
    HYPRE_GMRESSetPrecond(gmres, (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
                           (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup, amg);
 
@@ -755,8 +788,13 @@ bool lccl_SolveElectricField(
    HYPRE_GMRESGetNumIterations(gmres, &its);
    HYPRE_GMRESGetFinalRelativeResidualNorm(gmres, &relres);
    rmeSolveTimer.stop((double)its, "GMRES iterations");
-   if (myRank == MASTER_RANK) {
-      fprintf(stderr, "lcclSolveElectricField: GMRES/BoomerAMG finished, relres=%e after %d iters\n", (double)relres, (int)its);
+   const bool rmeFailed = !std::isfinite((double)relres) || relres > P::lcclRmeFailRelres;
+   if (myRank == MASTER_RANK && (rmeFailed || lccl_ReportThisStep())) {
+      fprintf(stderr, "lcclSolveElectricField: GMRES/BoomerAMG finished, relres=%e after %d iters%s\n", (double)relres, (int)its,
+              rmeFailed ? " -- FAILED (above fieldsolver.rmeFailRelres)" : "");
+   }
+   if (rmeFailed && P::lcclSolverFailBailout) {
+      bailout(true, "LCCL: the Eq. 38 solve failed (fieldsolver.rmeFailRelres, fieldsolver.solverFailBailout)", __FILE__, __LINE__);
    }
 
    // ---- Step 4: extract E^{k+theta}, compute E^{k+1} (Eq. 40) ----
@@ -790,7 +828,7 @@ bool lccl_SolveElectricField(
 
    fsgrid.updateGhostCells(Etheta);
    fsgrid.updateGhostCells(Ekp1);
-   return (relres < 1e-6); // FIXME: what convergence threshold the rest of the solver treats as success
+   return !rmeFailed;
 }
 
 /* ============================================================
@@ -1524,15 +1562,13 @@ void lccl_GaussLawCorrection(
 
    HYPRE_Solver amgPrecond, pcgSolver;
    HYPRE_BoomerAMGCreate(&amgPrecond);
-   HYPRE_BoomerAMGSetPrintLevel(amgPrecond, 0);
-   HYPRE_BoomerAMGSetMaxIter(amgPrecond, 1);
-   HYPRE_BoomerAMGSetTol(amgPrecond, 0.0);
+   lccl_ConfigureBoomerAMG(amgPrecond, P::lcclGaussAMGCycles);
 
    HYPRE_ParCSRPCGCreate(MPI_COMM_WORLD, &pcgSolver);
-   HYPRE_PCGSetMaxIter(pcgSolver, 200);
-   HYPRE_PCGSetTol(pcgSolver, 1e-10);
+   HYPRE_PCGSetMaxIter(pcgSolver, (HYPRE_Int)P::lcclGaussMaxIterations);
+   HYPRE_PCGSetTol(pcgSolver, P::lcclGaussTolerance);
    HYPRE_PCGSetTwoNorm(pcgSolver, 1);
-   HYPRE_PCGSetPrintLevel(pcgSolver, 0);
+   HYPRE_PCGSetPrintLevel(pcgSolver, P::lcclHyprePrintLevel);
    HYPRE_PCGSetPrecond(pcgSolver, (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSolve,
                         (HYPRE_PtrToSolverFcn)HYPRE_BoomerAMGSetup, amgPrecond);
 
@@ -1547,7 +1583,7 @@ void lccl_GaussLawCorrection(
       HYPRE_PCGGetNumIterations(pcgSolver, &pcgIts);
       HYPRE_PCGGetFinalRelativeResidualNorm(pcgSolver, &pcgRelres);
       gaussSolveTimer.stop((double)pcgIts, "PCG iterations");
-      if (myRank == MASTER_RANK) {
+      if (myRank == MASTER_RANK && lccl_ReportThisStep()) {
          fprintf(stderr, "lcclGaussLawCorrection: Hypre PCG/BoomerAMG finished with relative residual %e "
                          "after %d iterations\n", (double)pcgRelres, (int)pcgIts);
       }
@@ -1628,13 +1664,14 @@ void lccl_GaussLawCorrection(
 
    // Consistent form: low-pass filter phi (after the solve, so the charge of a sharp edge is weighted
    // where it sits before anything is smoothed). Ghost-exchanged for the centred gradient below.
-   if (P::lcclGaussConsistent && pcgRelres <= 1.0) {
+   const bool gaussApplied = std::isfinite((double)pcgRelres) && pcgRelres <= P::lcclGaussFailRelres;
+   if (P::lcclGaussConsistent && gaussApplied) {
       lccl_FilterScalar(phiGrid, P::lcclGaussFilterPasses, activeAxis, apWeight, P::lcclGaussFilterBarrier,
                         technical, fsgrid);
    }
 
-   // Eq. 41, only applied if actually converged
-   if (pcgRelres <= 1.0) {
+   // Eq. 41, only applied if the solve did not fail (fieldsolver.gaussLawFailRelres)
+   if (gaussApplied) {
       fsgrid.parallel_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
          phiprof::initializeTimer("LCCL: apply Gauss correction to E"), technical,
@@ -1660,9 +1697,15 @@ void lccl_GaussLawCorrection(
          });
       fsgrid.updateGhostCells(Ekp1);
 
-   } else if (myRank == MASTER_RANK) {
-      fprintf(stderr, "lcclGaussLawCorrection: relres=%e > 1.0 -- solve diverged, "
-                      "SKIPPING correction this step, E left unmodified\n", (double)pcgRelres);
+   } else {
+      if (myRank == MASTER_RANK) {
+         fprintf(stderr, "lcclGaussLawCorrection: relres=%e above fieldsolver.gaussLawFailRelres = %g -- solve failed, "
+                         "SKIPPING correction this step, E left unmodified\n", (double)pcgRelres, (double)P::lcclGaussFailRelres);
+      }
+      if (P::lcclSolverFailBailout) {
+         bailout(true, "LCCL: the Gauss-correction solve failed (fieldsolver.gaussLawFailRelres, fieldsolver.solverFailBailout)",
+                 __FILE__, __LINE__);
+      }
    }
 }
 
@@ -1828,6 +1871,8 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
       lccl_PublishToVol(state.B.view(), state.E.view(), vol, technical, fsgrid);
       return true;
    }
+
+   if (!lccl_CheckSolverOptions()) { return false; }
 
    const size_t nStorage = fsgrid.getNumStorageCells();
    fsgrid::FsData<std::array<Real,9>> mu(nStorage);

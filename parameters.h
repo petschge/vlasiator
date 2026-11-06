@@ -156,6 +156,23 @@ struct Parameters {
    static Real lcclGaussFilterBarrier;   /*!< LCCL solver: the filter does not mix cells whose AP weights differ by more than this factor (default 2; <= 1 = off). */
    static Real lcclGaussUniformityRatio; /*!< LCCL solver: correction only where the plasma density varies by less than this factor nearby (default 2; <= 1 = everywhere). */
    static uint lcclGaussUniformityWidth; /*!< LCCL solver: half-width (cells) of the neighbourhood checked for lcclGaussUniformityRatio. */
+   static Real lcclRmeTolerance;         /*!< LCCL solver: relative residual at which GMRES stops in the RME solve (Eq. 38). */
+   static uint lcclRmeMaxIterations;     /*!< LCCL solver: GMRES iteration limit of the RME solve. */
+   static uint lcclRmeKrylovDimension;   /*!< LCCL solver: GMRES restart length of the RME solve. */
+   static uint lcclRmeAMGCycles;         /*!< LCCL solver: BoomerAMG V-cycles per preconditioner application in the RME solve. */
+   static Real lcclRmeFailRelres;        /*!< LCCL solver: relative residual above which the RME solve counts as failed. */
+   static Real lcclGaussTolerance;       /*!< LCCL solver: relative residual at which PCG stops in the Gauss correction. */
+   static uint lcclGaussMaxIterations;   /*!< LCCL solver: PCG iteration limit of the Gauss correction. */
+   static uint lcclGaussAMGCycles;       /*!< LCCL solver: BoomerAMG V-cycles per preconditioner application in the Gauss correction. */
+   static Real lcclGaussFailRelres;      /*!< LCCL solver: relative residual above which the Gauss correction is skipped for the step. */
+   static Real lcclAMGStrongThreshold;   /*!< LCCL solver: BoomerAMG strong threshold for both solves (<= 0: HYPRE default). */
+   static int lcclAMGCoarsenType;        /*!< LCCL solver: BoomerAMG coarsening type for both solves (< 0: HYPRE default). */
+   static int lcclAMGRelaxType;          /*!< LCCL solver: BoomerAMG relaxation type for both solves (< 0: HYPRE default). */
+   static int lcclAMGInterpType;         /*!< LCCL solver: BoomerAMG interpolation type for both solves (< 0: HYPRE default). */
+   static int lcclAMGAggressiveLevels;   /*!< LCCL solver: BoomerAMG levels of aggressive coarsening for both solves (< 0: HYPRE default). */
+   static int lcclHyprePrintLevel;       /*!< LCCL solver: HYPRE print level of the Krylov solvers and BoomerAMG. */
+   static bool lcclSolverFailBailout;    /*!< LCCL solver: stop the run (bailout) when a solve fails. */
+   static uint lcclSolverReportInterval; /*!< LCCL solver: steps between the solver report lines (0: only failures). */
    static Real resistivity;             /*!< Resistivity in Ohm's law eta*J term. */
    static uint ohmHallTerm; /*!< Enable/choose spatial order of Hall term in Ohm's law JXB term. 0: off, 1: 1st spatial
                                order, 2: 2nd spatial order. */
