@@ -154,7 +154,7 @@ VDF_SHEET_LINES = True
 # into the edge cell (cpu_acc_map.cpp), so prefer it only where the +v edge is the one reached.
 WALL_BLOCK_MARGIN = 1
 RESTART_WALLTIME = 0.0  # io.restart_walltime_interval in s of walltime; 0 = no restart files
-GAUSS_LAW = True        # fieldsolver.enforceGaussLaw (Eq. 45 correction of E^{k+1})
+GAUSS_LAW = True        # fieldsolver.enforceGaussLaw (Gauss correction of E^{k+1}; consistent form by default)
 # vlasovsolver.maxSlAccelerationRotation: the largest gyration angle (degrees) one acceleration
 # subcycle may take; Vlasiator subcycles each step into pieces of this size plus a remainder.
 MAX_ACC_ROTATION = 25.0

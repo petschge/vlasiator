@@ -845,6 +845,241 @@ void lccl_UpdateMagneticField(
  * next step's E^k); E^{k+theta}, which the Vlasov push already uses, is not.
  */
 
+// ---- Consistent Gauss correction (fieldsolver.gaussLawConsistent, the default) -------------------------
+// The translation moves charge between cells with face fluxes of a high-order reconstruction, so for
+// a mode exp(i k x) it changes rho with (very nearly) the exact wavenumber k. The centred divergence
+// of Eq. 45 sees K = sin(k dx)/dx instead. With that mismatch the correction feeds back on the
+// Langmuir oscillation and makes short waves grow (white paper Sec. 3.8; cold analysis: up to
+// 0.5 omega_pe for omega_pe dt < 1 when Landau damping is absent). The consistent form:
+//  - takes the residual rho/eps0 - D.E^k with the divergence D = K Q(delta^2) along each axis,
+//    Q = sum_{j<n} c_j x^j, x = -delta^2/4, c_j = 4^j (j!)^2/(2j+1)!, the series of k/K in
+//    sin^2(k dx/2) (error O(sin^(2n)(k dx/2)); n = fieldsolver.gaussLawOrder);
+//  - solves the compact system of Eq. 45, -div[(I + dt^2 mu/eps0) grad phi] = residual;
+//  - low-pass filters phi with m binomial passes per axis (transfer cos^(2m)(k dx/2);
+//    m = fieldsolver.gaussLawFilterPasses): near k dx = pi no collocated operator matches the
+//    translation (K -> 0), and without a correction the cold analysis is neutral there. In a uniform
+//    plasma filtering phi is the same as filtering the residual; at a sharp plasma-vacuum edge it is
+//    not: a residual filter spreads the edge charge from the dense side, where the weight
+//    1 + dt^2 mu/eps0 makes the correction weak, into the vacuum, where it acts in full, and made the
+//    high-density plasma opening switch fail within 14 steps;
+//  - corrects E with the centred gradient of Eq. 45; with the filter in place this is as stable as a
+//    matching gradient and needs no further passes.
+// Two measures keep it away from sharp plasma edges, which the uniform analysis does not cover; in a
+// uniform plasma neither changes anything:
+//  - the filter treats a neighbour whose weight differs by more than fieldsolver.gaussLawFilterBarrier
+//    from that of the cell as the cell itself, so it does not mix plasma and vacuum;
+//  - cells whose neighbourhood of fieldsolver.gaussLawUniformityWidth cells contains plasma densities
+//    differing by more than fieldsolver.gaussLawUniformityRatio, or no plasma, get neither a correction
+//    source nor a correction: the series reaches 7 cells to either side and would distort sheaths
+//    narrower than a cell. There Ampere's law alone acts, as without a correction.
+// Communication: every sweep reads at most two cells away along an axis (the ghost width
+// FS_STENCIL_WIDTH = 2) and treats all axes at once, so the extra ghost exchanges per step are
+// ceil((n-1)/2) for the series, ceil(m/2) for the filter and about ceil(width/2)-1 for the mask,
+// independent of the number of dimensions: 12 for the defaults n = 7, m = 12, width 8.
+// Cold, linear analysis over all k and 0.005 <= omega_pe dt <= 20, in one and two dimensions:
+// theta = 1 neutral or damped; theta = 1/2 at most 1e-4 omega_pe (3e-5 for omega_pe dt >= 0.02).
+// fieldsolver.gaussLawConsistent = 0 restores Eq. 45 as written.
+static const Real lcclSeriesCoeff[8] = {1.0, 2.0/3.0, 8.0/15.0, 16.0/35.0, 128.0/315.0, 256.0/693.0,
+                                         1024.0/3003.0, 2048.0/6435.0};
+
+static inline bool lccl_IsPhysicalCell(uint flag) {
+   return flag != sysboundarytype::DO_NOT_COMPUTE && flag != sysboundarytype::OUTER_BOUNDARY_PADDING;
+}
+
+typedef fsgrid::FsData<std::array<Real,1>> ApScalarField;
+
+// out[c] = Q(delta_c^2) E[c] for every active axis c (out[c] = E[c] for inactive axes), by Horner's
+// scheme in x^2: Q = P_0 + x^2 (P_1 + x^2 (P_2 + ...)), P_i = c_2i + c_2i+1 x. Each level reads the
+// previous one up to two cells away, so one ghost exchange per level; out is ghost-exchanged on return.
+// Terms whose stencil would leave the physical cells are dropped (lower order next to boundaries).
+static void lccl_SeriesQAllAxes(std::span<const ApVec3> E, ApNodeField& out, uint nTerms,
+                                const std::array<bool,3>& active, fsgrids::technicalspan technical,
+                                FieldSolverGrid& fsgrid) {
+   const size_t nStorage = E.size();
+   const int degree = (int)std::min<uint>(std::max<uint>(nTerms, 1u), 8u) - 1;
+   auto coeff = [degree](int j) -> Real { return (j >= 0 && j <= degree) ? lcclSeriesCoeff[j] : 0.0; };
+   const int levels = degree/2 + 1;                       // P_0 .. P_{levels-1}
+   // the top level is a constant (c_degree) when degree is even: fold it into the next one
+   const bool topIsConstant = (degree % 2 == 0) && levels > 1;
+   const int firstLevel = topIsConstant ? levels - 2 : levels - 1;
+
+   ApNodeField prev(nStorage), cur(nStorage);
+   for (int level = firstLevel; level >= 0; --level) {
+      const bool hasInner = level < levels - 1;           // + x^2 T_{level+1}
+      const bool innerIsE = hasInner && topIsConstant && level == levels - 2;
+      const Real innerScale = innerIsE ? coeff(degree) : 1.0;
+      const auto pv = prev.view();
+      auto cv = cur.view();
+      fsgrid.parallel_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("LCCL: consistent Gauss, series level"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            const size_t lid = stencil.ooo();
+            for (int c = 0; c < 3; ++c) {
+               if (!active[c]) { cv[lid][c] = E[lid][c]; continue; }
+               Real v = coeff(2*level)*E[lid][c];
+               if (!lccl_IsPhysicalCell(sysBoundaryFlag)) { cv[lid][c] = v; continue; }
+               std::array<int,3> o1{0,0,0}, o2{0,0,0};
+               o1[c] = 1; o2[c] = 2;
+               const bool has1 = stencil.cellExists(o1[0], o1[1], o1[2]) && stencil.cellExists(-o1[0], -o1[1], -o1[2]);
+               size_t p1 = lid, m1 = lid;
+               bool ok1 = false;
+               if (has1) {
+                  p1 = stencil.indexFromOffset(o1[0], o1[1], o1[2]);
+                  m1 = stencil.indexFromOffset(-o1[0], -o1[1], -o1[2]);
+                  ok1 = lccl_IsPhysicalCell(technical[p1].sysBoundaryFlag) && lccl_IsPhysicalCell(technical[m1].sysBoundaryFlag);
+               }
+               if (ok1) {
+                  // x f = -(f(+1) - 2 f + f(-1))/4
+                  v += coeff(2*level + 1)*(-0.25)*(E[p1][c] - 2.0*E[lid][c] + E[m1][c]);
+               }
+               if (hasInner && ok1) {
+                  const bool has2 = stencil.cellExists(o2[0], o2[1], o2[2]) && stencil.cellExists(-o2[0], -o2[1], -o2[2]);
+                  if (has2) {
+                     const size_t p2 = stencil.indexFromOffset(o2[0], o2[1], o2[2]);
+                     const size_t m2 = stencil.indexFromOffset(-o2[0], -o2[1], -o2[2]);
+                     if (lccl_IsPhysicalCell(technical[p2].sysBoundaryFlag) && lccl_IsPhysicalCell(technical[m2].sysBoundaryFlag)) {
+                        // x^2 f = (f(+2) - 4 f(+1) + 6 f - 4 f(-1) + f(-2))/16
+                        const Real f2 = innerIsE ? E[p2][c] : pv[p2][c];
+                        const Real f1 = innerIsE ? E[p1][c] : pv[p1][c];
+                        const Real f0 = innerIsE ? E[lid][c] : pv[lid][c];
+                        const Real g1 = innerIsE ? E[m1][c] : pv[m1][c];
+                        const Real g2 = innerIsE ? E[m2][c] : pv[m2][c];
+                        v += innerScale*(f2 - 4.0*f1 + 6.0*f0 - 4.0*g1 + g2)/16.0;
+                     }
+                  }
+               }
+               cv[lid][c] = v;
+            }
+         });
+      fsgrid.updateGhostCells(cv);
+      prev.swap(cur);
+   }
+   out.swap(prev);
+}
+
+// Uniformity mask for the consistent correction: 1 where the plasma density (trace of mu, which is
+// proportional to sum_s q_s^2 n_s/m_s) varies by less than 'ratio' within 'width' cells along every
+// active axis, 0 elsewhere and wherever there is no plasma. The neighbourhood max/min is built with
+// sweeps two cells wide (one ghost exchange between sweeps), as the other operators here.
+static void lccl_UniformityMask(std::span<const std::array<Real,9>> mu, Real ratio, uint width,
+                                const std::array<bool,3>& active, fsgrids::technicalspan technical,
+                                FieldSolverGrid& fsgrid, std::vector<Real>& mask) {
+   const size_t nStorage = mu.size();
+   ApNodeField a(nStorage), b(nStorage);   // components 0 and 1: neighbourhood max and min
+   {
+      auto av = a.view();
+      for (size_t c = 0; c < nStorage; ++c) {
+         const Real tr = mu[c][0] + mu[c][4] + mu[c][8];
+         av[c][0] = tr; av[c][1] = tr; av[c][2] = 0.0;
+      }
+   }
+   const int rx = active[0] ? 2 : 0, ry = active[1] ? 2 : 0, rz = active[2] ? 2 : 0;
+   const uint sweeps = std::max(1u, (width + 1)/2);
+   for (uint sw = 0; sw < sweeps; ++sw) {
+      const auto av = a.view();
+      auto bv = b.view();
+      fsgrid.parallel_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("LCCL: consistent Gauss, uniformity mask"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            const size_t lid = stencil.ooo();
+            Real mx = av[lid][0], mn = av[lid][1];
+            for (int dz = -rz; dz <= rz; ++dz) {
+               for (int dy = -ry; dy <= ry; ++dy) {
+                  for (int dx = -rx; dx <= rx; ++dx) {
+                     if (!(dx || dy || dz) || !stencil.cellExists(dx, dy, dz)) { continue; }
+                     const size_t n = stencil.indexFromOffset(dx, dy, dz);
+                     if (!lccl_IsPhysicalCell(technical[n].sysBoundaryFlag)) { continue; }
+                     mx = std::max(mx, av[n][0]);
+                     mn = std::min(mn, av[n][1]);
+                  }
+               }
+            }
+            bv[lid][0] = mx; bv[lid][1] = mn; bv[lid][2] = 0.0;
+         });
+      if (sw + 1 < sweeps) { fsgrid.updateGhostCells(bv); }
+      a.swap(b);
+   }
+   mask.assign(nStorage, 0.0);
+   const auto av = a.view();
+   fsgrid.parallel_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("LCCL: consistent Gauss, uniformity mask"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         const Real mx = av[lid][0], mn = av[lid][1];
+         mask[lid] = (mn > 0.0 && mx <= ratio*mn) ? 1.0 : 0.0;
+      });
+}
+
+// One tensor-product binomial sweep over NOT_SYSBOUNDARY cells: weights (1,2,1)/4 (halfWidth 1) or
+// (1,4,6,4,1)/16 (halfWidth 2) along each active axis, i.e. cos^2 or cos^4(k dx/2) per axis in a single
+// sweep. A stencil point that is not an interior cell is replaced by the centre value (zero gradient,
+// constants are preserved); boundary cells keep their value.
+static void lccl_BinomialTensorSweep(ApScalarField& src, ApScalarField& dst, int halfWidth,
+                                     const std::array<bool,3>& active, std::span<const Real> apWeight,
+                                     Real barrier, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   const bool useBarrier = barrier > 1.0 && apWeight.size() == src.size();
+   static const Real w1[3] = {0.25, 0.5, 0.25};
+   static const Real w2[5] = {1.0/16.0, 4.0/16.0, 6.0/16.0, 4.0/16.0, 1.0/16.0};
+   const Real* w = (halfWidth == 2) ? w2 : w1;
+   const int r = (halfWidth == 2) ? 2 : 1;
+   const int rx = active[0] ? r : 0, ry = active[1] ? r : 0, rz = active[2] ? r : 0;
+   const auto sv = src.view();
+   auto dv = dst.view();
+   fsgrid.parallel_for(
+      [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+      phiprof::initializeTimer("LCCL: consistent Gauss, residual filter"), technical,
+      [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+          cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+         const size_t lid = stencil.ooo();
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { dv[lid][0] = sv[lid][0]; return; }
+         const Real centre = sv[lid][0];
+         Real acc = 0.0;
+         for (int dz = -rz; dz <= rz; ++dz) {
+            const Real wz = rz ? w[dz + r] : 1.0;
+            for (int dy = -ry; dy <= ry; ++dy) {
+               const Real wy = ry ? w[dy + r] : 1.0;
+               for (int dx = -rx; dx <= rx; ++dx) {
+                  const Real wx = rx ? w[dx + r] : 1.0;
+                  Real v = centre;
+                  if ((dx || dy || dz) && stencil.cellExists(dx, dy, dz)) {
+                     const size_t n = stencil.indexFromOffset(dx, dy, dz);
+                     bool use = technical[n].sysBoundaryFlag == sysboundarytype::NOT_SYSBOUNDARY;
+                     if (use && useBarrier) {
+                        const Real ratio = apWeight[n]/apWeight[lid];
+                        use = ratio <= barrier && ratio*barrier >= 1.0;
+                     }
+                     if (use) { v = sv[n][0]; }
+                  }
+                  acc += wx*wy*wz*v;
+               }
+            }
+         }
+         dv[lid][0] = acc;
+      });
+}
+
+// m binomial passes per active axis as ceil(m/2) tensor sweeps; f must be ghost-exchanged on entry and
+// is ghost-exchanged on return.
+static void lccl_FilterScalar(ApScalarField& f, uint passes, const std::array<bool,3>& active,
+                              std::span<const Real> apWeight, Real barrier,
+                              fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   ApScalarField tmp(f.size());
+   uint done = 0;
+   while (done < passes) {
+      const int halfWidth = (passes - done >= 2) ? 2 : 1;
+      lccl_BinomialTensorSweep(f, tmp, halfWidth, active, apWeight, barrier, technical, fsgrid);
+      done += (uint)halfWidth;
+      fsgrid.updateGhostCells(tmp.view());
+      f.swap(tmp);
+   }
+}
+
 void lccl_GaussLawCorrection(
    std::span<ApVec3> Ekp1,
    std::span<const ApVec3> Ek,
@@ -985,6 +1220,90 @@ void lccl_GaussLawCorrection(
               hasAnchorGlobal ? 1 : 0, meanRhoOverEps);
    }
 
+   // Consistent form: residual rho/eps0 - D.E^k with the translation-consistent divergence (see the
+   // description above lccl_SeriesQAllAxes). Axes with a single cell carry no derivative.
+   const size_t nStorageCells = fsgrid.getNumStorageCells();
+   const auto globalSize = fsgrid.getGlobalSize();
+   const std::array<bool,3> activeAxis = {globalSize[0] > 1, globalSize[1] > 1, globalSize[2] > 1};
+   ApScalarField gaussResid(nStorageCells);
+   double maskedResidualMean = 0.0;
+   bool useMaskedMean = false;
+   // Uniformity mask (fieldsolver.gaussLawUniformityRatio), kept for the application of the correction:
+   // masked cells get neither a correction source nor a correction, so the potential of the residual in
+   // the uniform regions cannot build up fields in the vacuum or the sheaths, where nothing removes them.
+   std::vector<Real> gaussMask;
+   // AP weight 1 + dt^2 tr(mu)/(3 eps0) per cell (mu is ghost-exchanged), for the filter barrier
+   std::vector<Real> apWeight;
+   if (P::lcclGaussConsistent && P::lcclGaussFilterBarrier > 1.0) {
+      apWeight.resize(nStorageCells);
+      for (size_t c = 0; c < nStorageCells; ++c) {
+         apWeight[c] = 1.0 + dt*dt*(mu[c][0] + mu[c][4] + mu[c][8])/(3.0*physicalconstants::EPS_0);
+      }
+   }
+   if (P::lcclGaussConsistent) {
+      if (P::lcclGaussOrder < 1 || P::lcclGaussOrder > 8) {
+         bailout(true, "fieldsolver.gaussLawOrder must be between 1 and 8", __FILE__, __LINE__);
+      }
+      ApNodeField QE(nStorageCells);
+      lccl_SeriesQAllAxes(Ek, QE, P::lcclGaussOrder, activeAxis, technical, fsgrid);
+      const auto qv = QE.view();
+      auto rv = gaussResid.view();
+      fsgrid.parallel_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("LCCL: consistent Gauss, residual"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            const size_t lid = stencil.ooo();
+            if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { rv[lid][0] = 0.0; return; }
+            Real divQE = 0.0;
+            for (int c = 0; c < 3; ++c) {
+               if (!activeAxis[c]) { continue; }
+               std::array<int,3> o{0,0,0}; o[c] = 1;
+               if (!stencil.cellExists(o[0], o[1], o[2]) || !stencil.cellExists(-o[0], -o[1], -o[2])) { continue; }
+               divQE += (qv[stencil.indexFromOffset(o[0], o[1], o[2])][c]
+                         - qv[stencil.indexFromOffset(-o[0], -o[1], -o[2])][c])/(2.0*dxyz[c]);
+            }
+            rv[lid][0] = rho[lid][0]/physicalconstants::EPS_0 - divQE;
+         });
+      if (P::lcclGaussUniformityRatio > 1.0) {
+         std::vector<Real>& mask = gaussMask;
+         lccl_UniformityMask(mu, P::lcclGaussUniformityRatio, P::lcclGaussUniformityWidth, activeAxis, technical, fsgrid, mask);
+         double sum_local = 0.0, sum_global = 0.0, masked_local = 0.0, masked_global = 0.0;
+         fsgrid.serial_for(
+            [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+            phiprof::initializeTimer("LCCL: consistent Gauss, apply mask"), technical,
+            [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+                cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+               if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
+               const size_t lid = stencil.ooo();
+               rv[lid][0] *= mask[lid];
+               sum_local += rv[lid][0];
+               masked_local += 1.0 - mask[lid];
+            });
+         MPI_Allreduce(&sum_local, &sum_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+         MPI_Allreduce(&masked_local, &masked_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+         // a periodic domain needs a right-hand side that integrates to zero; the masked residual
+         // no longer has the mean of rho/eps0, so its own mean replaces it below
+         maskedResidualMean = (nInteriorGlobal > 0.0) ? sum_global/nInteriorGlobal : 0.0;
+         useMaskedMean = true;
+         static int reported = 0;
+         if (myRank == MASTER_RANK && reported < 5) {
+            fprintf(stderr, "lcclGaussLawCorrection: uniformity mask removes the correction source in %.0f of %.0f cells\n",
+                    masked_global, nInteriorGlobal);
+            ++reported;
+         }
+      }
+      static bool announced = false;
+      if (!announced && myRank == MASTER_RANK) {
+         fprintf(stderr, "lcclGaussLawCorrection: consistent form, %u series terms, %u filter passes per axis on phi, "
+                 "barrier %g, uniformity mask %g over %u cells\n",
+                 (unsigned)P::lcclGaussOrder, (unsigned)P::lcclGaussFilterPasses, (double)P::lcclGaussFilterBarrier,
+                 (double)P::lcclGaussUniformityRatio, (unsigned)P::lcclGaussUniformityWidth);
+      }
+      announced = true;
+   }
+   const auto gaussResidView = gaussResid.view();
+
    fsgrid.serial_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
       phiprof::initializeTimer("LCCL: assemble Gauss-correction system"), technical,
@@ -1103,6 +1422,11 @@ void lccl_GaussLawCorrection(
 
          const Real rhoOverEpsRaw = rho[lid][0]/physicalconstants::EPS_0;
          bvals[lidx] = (rhoOverEpsRaw - meanRhoOverEps) - divE; // Eq. 45 RHS, SI, rescaled by 1/EPS_0, rho mean-subtracted
+         if (P::lcclGaussConsistent) {
+            // consistent residual; its mean is that of rho/eps0 (D.E sums to zero on a periodic grid), or that
+            // of the masked residual when the uniformity mask is on
+            bvals[lidx] = gaussResidView[lid][0] - (hasAnchorGlobal ? 0.0 : (useMaskedMean ? maskedResidualMean : meanRhoOverEps));
+         }
       });
 
    // Hand mvals/bvals to HYPRE via IJ, using dofBase for global row/column indices
@@ -1256,6 +1580,13 @@ void lccl_GaussLawCorrection(
       fsgrid.updateGhostCells(phiGrid.view());
    }
 
+   // Consistent form: low-pass filter phi (after the solve, so the charge of a sharp edge is weighted
+   // where it sits before anything is smoothed). Ghost-exchanged for the centred gradient below.
+   if (P::lcclGaussConsistent && pcgRelres <= 1.0) {
+      lccl_FilterScalar(phiGrid, P::lcclGaussFilterPasses, activeAxis, apWeight, P::lcclGaussFilterBarrier,
+                        technical, fsgrid);
+   }
+
    // Eq. 41, only applied if actually converged
    if (pcgRelres <= 1.0) {
       fsgrid.parallel_for(
@@ -1270,6 +1601,7 @@ void lccl_GaussLawCorrection(
             // phi-gradient here would silently overwrite that pinned value.
             if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
             const size_t lid = stencil.ooo();
+            if (!gaussMask.empty() && gaussMask[lid] < 0.5) { return; }   // masked: left to Ampere's law
             if (stencil.cellExists(1,0,0) && stencil.cellExists(-1,0,0)) {
                Ekp1[lid][0] -= 0.5*(phiGrid[stencil.indexFromOffset(1,0,0)][0]-phiGrid[stencil.indexFromOffset(-1,0,0)][0])/dxyz[0];
             }
