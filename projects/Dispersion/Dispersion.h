@@ -38,6 +38,7 @@ namespace projects {
       Real TEMPERATURE;
       Real densityPertRelAmp;
       Real velocityPertAbsAmp;
+      Real velocityNoiseRelAmp;
 
    };
 
@@ -67,6 +68,8 @@ namespace projects {
          const uint nRequested
       ) const override;
       virtual void calcCellParameters(spatial_cell::SpatialCell* cell, creal& t) override;
+      void addVelocityNoise(spatial_cell::SpatialCell* cell, const uint popID, const uint nBlocks,
+                            const Real V0X, const Real V0Y, const Real V0Z, const Real vth, const Real amplitude) const;
 
       Real B0;
       Real magXPertAbsAmp;

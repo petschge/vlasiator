@@ -24,6 +24,9 @@
 #include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <algorithm>
+#include <cstdint>
+#include <random>
 
 #include "../../common.h"
 #include "../../readparameters.h"
@@ -70,6 +73,7 @@ namespace projects {
         RP::add<Real>(pop + "_Dispersion.Temperature", "Temperature (K)", sP->TEMPERATURE,2.0e6);
         RP::add<Real>(pop + "_Dispersion.densityPertRelAmp", "Relative amplitude of the density perturbation", sP->densityPertRelAmp,0.1);
         RP::add<Real>(pop + "_Dispersion.velocityPertAbsAmp", "Absolute amplitude of the velocity perturbation", sP->velocityPertAbsAmp,1.0e6);
+        RP::add<Real>(pop + "_Dispersion.velocityNoiseRelAmp", "Relative amplitude of random noise in every velocity cell: f -> f (1 + a ((1/2 - r) - c.w)), r uniform in [0,1) and independent for every velocity cell, w = (1, (v - V0)/v_th), with c chosen so that the noise changes neither the density nor the bulk velocity of the cell. Unlike the density and velocity perturbations, the noise has structure in gyrophase at all harmonics, like the noise of particle codes, and so excites kinetic modes such as ion Bernstein modes; it adds no charge and no current. Reproducible: r depends only on Project_common.seed, the position of the cell, the population and the velocity cell. CPU builds only. 0: off", sP->velocityNoiseRelAmp,0.0);
       }
    }
 
@@ -163,6 +167,13 @@ namespace projects {
       #endif
       // Loop over blocks
       Realf rhosum = 0;
+      #ifdef USE_GPU
+      if (sP.velocityNoiseRelAmp != 0.0) {
+         std::cerr << "Dispersion: " << getObjectWrapper().particleSpecies[popID].name
+                   << "_Dispersion.velocityNoiseRelAmp is implemented for CPU builds only" << std::endl;
+         abort();
+      }
+      #endif
       arch::parallel_reduce<arch::null>(
          {WID, WID, WID, nRequested},
          ARCH_LOOP_LAMBDA (const uint i, const uint j, const uint k, const uint initIndex, Realf *lsum ) {
@@ -187,7 +198,101 @@ namespace projects {
                //lsum[0] += value;
             };
          }, rhosum);
+
+      #ifndef USE_GPU
+      if (sP.velocityNoiseRelAmp != 0.0) {
+         addVelocityNoise(cell, popID, nRequested, initV0X, initV0Y, initV0Z, std::sqrt(physicalconstants::K_B*initT/mass),
+                          sP.velocityNoiseRelAmp);
+      }
+      #endif
       return rhosum;
+   }
+
+   // Counter-based hash (splitmix64): a reproducible random number for every velocity cell, independent of the
+   // number of processes and threads and of the order in which the blocks are filled.
+   static inline uint64_t dispersionSplitmix64(uint64_t x) {
+      x += 0x9E3779B97F4A7C15ULL;
+      x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+      x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+      return x ^ (x >> 31);
+   }
+
+   /* Noise in velocity space (velocityNoiseRelAmp = a): f -> f (1 + a (eta - c.w)), eta = 1/2 - r uniform in
+    * (-1/2, 1/2] per velocity cell, w = (1, u_x, u_y, u_z), u = (v - V0)/v_th. The four coefficients c solve
+    * sum f w w^T c = sum f eta w over the cell's blocks, so that the noise changes neither sum f (the density) nor
+    * sum f u (the bulk velocity); it changes the shape of the distribution, including its structure in gyrophase.
+    * Values that would become negative (only possible for a > 1) are set to zero. */
+   void Dispersion::addVelocityNoise(spatial_cell::SpatialCell* cell, const uint popID, const uint nBlocks,
+                                     const Real V0X, const Real V0Y, const Real V0Z, const Real vth,
+                                     const Real amplitude) const {
+      vmesh::VelocityMesh* vmesh = cell->get_velocity_mesh(popID);
+      vmesh::VelocityBlockContainer* VBC = cell->get_velocity_blocks(popID);
+      const vmesh::GlobalID* GIDlist = vmesh->getGrid()->data();
+      Realf* data = VBC->getData();
+      std::knuth_b rnd;
+      setRandomCellSeed(cell, rnd);
+      const uint64_t key = (static_cast<uint64_t>(rnd()) << 32) ^ static_cast<uint64_t>(rnd())
+                           ^ (static_cast<uint64_t>(popID) << 56);
+      auto eta = [&](const vmesh::GlobalID gid, const uint idx) {
+         const uint64_t h = dispersionSplitmix64(key ^ (static_cast<uint64_t>(gid)*WID3 + idx));
+         return 0.5 - static_cast<Real>(h >> 11)*(1.0/9007199254740992.0);   // 2^-53
+      };
+      auto weights = [&](const Real* bc, const uint i, const uint j, const uint k, Real (&w)[4]) {
+         w[0] = 1.0;
+         w[1] = (bc[0] + (i + 0.5)*bc[3] - V0X)/vth;
+         w[2] = (bc[1] + (j + 0.5)*bc[4] - V0Y)/vth;
+         w[3] = (bc[2] + (k + 0.5)*bc[5] - V0Z)/vth;
+      };
+      // pass 1: M = sum f w w^T, S = sum f eta w
+      Real M[4][4] = {{0}}, S[4] = {0};
+      for (uint b = 0; b < nBlocks; ++b) {
+         Real bc[6];
+         vmesh->getBlockInfo(GIDlist[b], &bc[0]);
+         for (uint k = 0; k < WID; ++k) for (uint j = 0; j < WID; ++j) for (uint i = 0; i < WID; ++i) {
+            const uint idx = k*WID2 + j*WID + i;
+            const Real f = data[b*WID3 + idx];
+            if (f == 0.0) { continue; }
+            Real w[4];
+            weights(bc, i, j, k, w);
+            const Real e = eta(GIDlist[b], idx);
+            for (int p = 0; p < 4; ++p) {
+               S[p] += f*e*w[p];
+               for (int q = 0; q < 4; ++q) { M[p][q] += f*w[p]*w[q]; }
+            }
+         }
+      }
+      // solve M c = S (symmetric positive definite; Gaussian elimination with partial pivoting)
+      Real c[4];
+      {
+         Real A[4][5];
+         for (int p = 0; p < 4; ++p) { for (int q = 0; q < 4; ++q) { A[p][q] = M[p][q]; } A[p][4] = S[p]; }
+         for (int col = 0; col < 4; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < 4; ++r) { if (std::abs(A[r][col]) > std::abs(A[piv][col])) { piv = r; } }
+            if (A[piv][col] == 0.0) { return; }   // empty cell: nothing to perturb
+            for (int q = 0; q < 5; ++q) { std::swap(A[col][q], A[piv][q]); }
+            for (int r = 0; r < 4; ++r) {
+               if (r == col) { continue; }
+               const Real fac = A[r][col]/A[col][col];
+               for (int q = col; q < 5; ++q) { A[r][q] -= fac*A[col][q]; }
+            }
+         }
+         for (int p = 0; p < 4; ++p) { c[p] = A[p][4]/A[p][p]; }
+      }
+      // pass 2: apply
+      for (uint b = 0; b < nBlocks; ++b) {
+         Real bc[6];
+         vmesh->getBlockInfo(GIDlist[b], &bc[0]);
+         for (uint k = 0; k < WID; ++k) for (uint j = 0; j < WID; ++j) for (uint i = 0; i < WID; ++i) {
+            const uint idx = k*WID2 + j*WID + i;
+            Realf& f = data[b*WID3 + idx];
+            if (f == 0.0) { continue; }
+            Real w[4];
+            weights(bc, i, j, k, w);
+            const Real factor = 1.0 + amplitude*(eta(GIDlist[b], idx) - (c[0]*w[0] + c[1]*w[1] + c[2]*w[2] + c[3]*w[3]));
+            f = static_cast<Realf>(std::max(f*factor, 0.0));
+         }
+      }
    }
 
    void Dispersion::calcCellParameters(spatial_cell::SpatialCell* cell,creal& t) {
