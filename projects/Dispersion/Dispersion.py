@@ -104,7 +104,7 @@ parser.add_argument("--legend-loc",
 parser.add_argument("--no-numerical-dispersion",
                     dest="numerical_dispersion",
                     action="store_false",
-                    help="Do not overplot the numerical dispersion relation of the LCCL field solver")
+                    help="Do not overplot the numerical dispersion relation of the AP field solver")
 
 parser.add_argument("--fields",
                     action="store",
@@ -126,6 +126,22 @@ parser.add_argument("--window",
                     help="Hamming windows applied before the FFT. In a periodic domain the spatial window is not "
                          "needed and spreads each mode over neighbouring k bins, which biases --measure-cutoffs "
                          "for dispersive modes; use 'temporal' there (default: %(default)s)")
+parser.add_argument("--window-shape",
+                    dest="window_shape",
+                    action="store",
+                    choices=["hamming", "hann", "blackman", "blackmanharris"],
+                    default="hamming",
+                    help="Shape of the window(s) selected by --window. Hamming has the lowest first sidelobe but "
+                         "far sidelobes that decay only as 1/frequency (its ends are not zero), so a strong "
+                         "quasi-static signal leaks into all frequencies; Hann, Blackman and Blackman-Harris "
+                         "go to zero at the ends and suppress this (default: %(default)s)")
+parser.add_argument("--detrend",
+                    dest="detrend",
+                    action="store",
+                    choices=["none", "mean", "linear"],
+                    default="none",
+                    help="Remove the time mean or a linear trend of every cell and component before the FFT, "
+                         "which removes quasi-static signals and their leakage (default: %(default)s)")
 parser.add_argument("--cutoff-kbins",
                     dest="cutoff_kbins",
                     action="store",
@@ -142,6 +158,17 @@ parser.add_argument("--elec-bernstein",
                     dest="elec_bernstein",
                     action="store_true",
                     help="plot expectation for Electron bernstein modes (default: %(default)s)")
+parser.add_argument("--ion-bernstein",
+                    dest="ion_bernstein",
+                    action="store_true",
+                    help="plot expectation for ion Bernstein modes on the longitudinal field and the densities, "
+                         "if B0 is perpendicular to x and both species are present (default: %(default)s)")
+parser.add_argument("--ion-bernstein-bands",
+                    dest="ion_bernstein_bands",
+                    type=int,
+                    default=8,
+                    help="Number of ion Bernstein bands to compute, band n lying between n and n+1 W_ci; with --wmax only "
+                         "the bands below the top of the plot (default: %(default)s)")
 parser.add_argument("dirname",
                     nargs='*',
                     action="store",
@@ -153,6 +180,8 @@ args = parser.parse_args()
 
 if args.elec_bernstein:
     from bernstein import bernstein_root_in_bracket
+if args.ion_bernstein:
+    from bernstein import ion_bernstein_bands
 
 if len(args.dirname) != 1:
     sys.stderr.write(str(args.dirname)+" is a list with more than one entry. That doesn't work currently. Please make separate calls to this tool\n")
@@ -208,7 +237,7 @@ def auto_squeeze_scalar(array):
         else:
             return array
 
-def lccl_numerical_omega(k, dx, dt, wp, theta):
+def ap_numerical_omega(k, dx, dt, wp, theta):
     """Frequency of the transverse EM mode in the AP (CSL-RME) field solver by Liu, Cai, Cao and Lapenta.
 
     Cold, unmagnetised plasma; K = sin(k dx)/dx is the centred collocated curl.
@@ -294,6 +323,12 @@ def read_vec(f, name):
     v = f.read_variable(name)[cellids.argsort()]    # CellID-1 = i + nx*j + nx*ny*k
     return np.average(v.reshape([zsize*ysize, xsize, 3]), axis=0)
 
+def read_vg_scalar(f, name):
+    """Cell-centred scalar along x, averaged over the ignorable directions: shape (xsize,)."""
+    cellids = f.read_variable("cellid")
+    v = f.read_variable(name)[cellids.argsort()]    # CellID-1 = i + nx*j + nx*ny*k
+    return np.average(v.reshape([zsize*ysize, xsize]), axis=0)
+
 # Analyze first timestep
 for i,t in enumerate(timesteps[:1]):
     #f = analysator.vlsvfile.VlsvReader(args.dirname+"/bulk."+"{:07d}".format(t)+".vlsv", fsGridDecomposition=[1,1,1])
@@ -349,6 +384,19 @@ for i,t in enumerate(timesteps[:1]):
     else:
         have_rho = False
 
+    if f.check_variable("vg_rhoq"):
+        # cell-centred charge density from the Vlasov moments (fg_rhoq above is its copy on the field grid)
+        have_rhoqvg = True
+        try:
+            info = f.read_variable_info("vg_rhoq")
+            units = info.latexunits if have_latex else info.units
+        except Exception:
+            units = r"$\mathrm{C\,m^{-3}}$" if have_latex else "C/m^3"
+        variablename["rhoqvg"] = r"$\rho_q$" if have_latex else "rho_q"
+        variableunit["rhoqvg"] = units
+    else:
+        have_rhoqvg = False
+
     if f.check_variable("vg_eje"):
         have_Eje = True
         if have_latex:
@@ -394,6 +442,7 @@ if args.onlyE:
     have_B = False
     have_Phi = False
     have_rho = False
+    have_rhoqvg = False
     have_Eje = False
     have_ne = False
     have_ni = False
@@ -425,7 +474,7 @@ print("dt = "+str(dt)+" s")
 print("dtout = "+str(dtout)+" s")
 print("T_end = "+str(timesteps[-1]*dtout)+" s")
 print("dx = "+str(dx)+" m")
-print("field solver = "+fieldsolver_method+(", theta = "+str(theta) if fieldsolver_method == "LCCL" else ""))
+print("field solver = "+fieldsolver_method+(", theta = "+str(theta) if fieldsolver_method in ("AP", "LCCL") else ""))
 
 # some projects have additional keys in the config that we can use
 if "proton_Dispersion" in config and "rho" in config["proton_Dispersion"]:
@@ -523,10 +572,10 @@ print("r_i = "+str(ri)+" m")
 print("r_e = "+str(re)+" m")
 print("l_D = "+str(lD)+" m")
 
-# The LCCL curve is derived for B = 0; fg_b of an unmagnetised run still averages to a tiny nonzero B0.
-show_lccl_curve = args.numerical_dispersion and fieldsolver_method == "LCCL" and Wce < 1e-2*wpe
-if args.numerical_dispersion and fieldsolver_method == "LCCL" and not show_lccl_curve:
-    print("Not overplotting the LCCL numerical dispersion: only derived for an unmagnetised plasma (W_ce << w_pe)")
+# The AP curve is derived for B = 0; fg_b of an unmagnetised run still averages to a tiny nonzero B0.
+show_ap_curve = args.numerical_dispersion and fieldsolver_method in ("AP", "LCCL") and Wce < 1e-2*wpe
+if args.numerical_dispersion and fieldsolver_method in ("AP", "LCCL") and not show_ap_curve:
+    print("Not overplotting the AP numerical dispersion: only derived for an unmagnetised plasma (W_ce << w_pe)")
 # The L/R curves assume k || B0; for k perpendicular to B0 the transverse mode is the X mode.
 
 # Geometry of B0 relative to the resolved direction x decides which reference curves apply
@@ -649,8 +698,8 @@ def measure_cutoffs(power, kx, w, label):
                 cutoff_file.write("{}, {}, {:.5f}, {}, {:.5f}, {:.5f}, {:.2f}\n".format(
                     label, name, wc/wpe, "nan" if np.isnan(wk) else "{:.5f}".format(wk/wpe), wm/wpe, dw/wpe, contrast))
         print("  {} {}: {}".format(label, name, msg))
-    if show_lccl_curve and "w_p" in predicted_cutoffs:
-        print("  ({}: the LCCL scheme moves w_p to {:.4f} w_pe at k = 0)".format(label, lccl_numerical_omega(0., dx, dt, wp, theta)/wpe))
+    if show_ap_curve and "w_p" in predicted_cutoffs:
+        print("  ({}: the AP scheme moves w_p to {:.4f} w_pe at k = 0)".format(label, ap_numerical_omega(0., dx, dt, wp, theta)/wpe))
 
 # Kinetic reference curves: Maxwellian electrons and protons with v_th = sqrt(kB T/m), zeta = (...)/(sqrt(2) k v_th)
 show_kinetic_langmuir = args.kinetic and geometry in ("unmagnetised", "parallel")
@@ -707,6 +756,8 @@ if have_Phi:
     Phi = np.zeros( (len(timesteps), xsize, 1) , dtype=complex)
 if have_rho:
     rho = np.zeros( (len(timesteps), xsize, 1) , dtype=complex)
+if have_rhoqvg:
+    rhoqvg = np.zeros( (len(timesteps), xsize, 1) , dtype=complex)
 if have_Eje:
     Eje = np.zeros( (len(timesteps), xsize, 5) , dtype=complex)
 if have_ne:
@@ -735,6 +786,8 @@ for i in tqdm(range(len(timesteps))):
     if have_rho:
         fg_rhoq = f.read_fsgrid_variable("fg_rhoq")
         rho[i,:,0] = auto_squeeze_scalar(fg_rhoq)
+    if have_rhoqvg:
+        rhoqvg[i,:,0] = read_vg_scalar(f, "vg_rhoq")
     if have_Eje:
         cellids = f.read_variable('cellid')
         vg_eje = f.read_variable('vg_eje')
@@ -770,14 +823,33 @@ if have_Eje:
     Eje[:,:,4] = Eje[:,:,1] + complex("j")*Eje[:,:,2]
 
 # window as required
+def window_function(n):
+    if args.window_shape == "hann":
+        return np.hanning(n)
+    if args.window_shape == "blackman":
+        return np.blackman(n)
+    if args.window_shape == "blackmanharris":
+        from scipy.signal.windows import blackmanharris
+        return blackmanharris(n)
+    return np.hamming(n)
 if do_windowing=="spatial" or do_windowing=="both":
-    spatial_window = np.hamming(xsize)
+    spatial_window = window_function(xsize)
 else:
     spatial_window = np.ones(xsize)
 if do_windowing=="temporal" or do_windowing=="both":
-    temporal_window = np.hamming(tsize)
+    temporal_window = window_function(tsize)
 else:
     temporal_window = np.ones(tsize)
+
+def detrended(v):
+    """Remove the time mean or linear trend of every cell (axis 0 is time); works for complex data."""
+    if args.detrend == "none":
+        return v
+    v = v - v.mean(axis=0)
+    if args.detrend == "linear":
+        t = np.arange(v.shape[0]) - 0.5*(v.shape[0] - 1)
+        v = v - np.outer(t, (t[:, None]*v).sum(axis=0)/(t**2).sum())
+    return v
 window = np.outer(spatial_window, temporal_window).T
 
 vectorcomponentnames = ["x","y","z", "left", "right"]
@@ -873,6 +945,9 @@ if have_Phi:
 if have_rho:
     variables["rho"] = rho
     total += 3
+if have_rhoqvg:
+    variables["rhoqvg"] = rhoqvg
+    total += 3
 if have_Eje:
     variables["Eje"] = Eje
     total += 3+5+5
@@ -888,6 +963,25 @@ if have_ni:
 if have_tqdm:
     pbar = tqdm(total=total)
 
+# Ion Bernstein modes, when they apply: k perpendicular to B0, both species with their densities and temperatures
+ibw = None
+if args.ion_bernstein and not (geometry == "perpendicular" and Wci > 0. and None not in (ni0, ne0, Ti0, Te0)):
+    print("Not overplotting ion Bernstein modes: they need B0 perpendicular to x and both species")
+if (args.ion_bernstein and geometry == "perpendicular" and Wci > 0. and None not in (ni0, ne0, Ti0, Te0)):
+    kmax_ibw = np.pi/dx
+    if args.kmax != "":
+        kmax_ibw = min(kmax_ibw, float(args.kmax)/lengthnorm)
+    kmax_ibw = min(kmax_ibw, 40./ri)                    # beyond k r_i = 40 the bands sit on the harmonics
+    nbands = args.ion_bernstein_bands
+    if args.wmax != "":
+        nbands = min(nbands, int(float(args.wmax)*freqnorm/Wci))
+    if nbands >= 1:
+        kibw = np.linspace(kmax_ibw/400., kmax_ibw, 400)
+        ibw = ion_bernstein_bands(kibw, nbands, Wci, Wce, ri, re,
+                                  np.sqrt(SI.eps0*SI.kB*Ti0/(ni0*SI.e**2)), np.sqrt(SI.eps0*SI.kB*Te0/(ne0*SI.e**2)))
+        print("ion Bernstein bands (W_ci) at k r_i = 1, 2, 3: " + "; ".join(
+            ", ".join("{:.3f}".format(x) for x in ibw[np.argmin(abs(kibw*ri - kr))]/Wci) for kr in (1., 2., 3.)))
+
 if args.elec_bernstein:
     maxbernstein = 10
     kbernstein = np.linspace(0.0, np.pi/dx, xsize+1)[1:]
@@ -898,7 +992,7 @@ if args.elec_bernstein:
 
 # plot everything we have loaded and computed
 for variablecode,variable in variables.items():
-    if variablecode in ["ne", "ni", "deltane", "deltani", "Phi", "rho"]: # the scalar components we know how to plow
+    if variablecode in ["ne", "ni", "deltane", "deltani", "Phi", "rho", "rhoqvg"]: # the scalar components we know how to plow
         componentnames = scalarcomponentnames
     else:
         componentnames = vectorcomponentnames
@@ -938,7 +1032,7 @@ for variablecode,variable in variables.items():
         # plot k-omega power
         plt.figure("k"+variablecode+componentnames[c], figsize=args.figsize)
         plt.title(args.title)
-        kV = np.fft.fftshift(np.fft.fft2(variable[:,:,c]*window))
+        kV = np.fft.fftshift(np.fft.fft2(detrended(variable[:,:,c])*window))
         w  = 2.*np.pi*np.fft.fftshift(np.fft.fftfreq(tsize, d=dtout))
         kx = 2.*np.pi*np.fft.fftshift(np.fft.fftfreq(xsize, d=dx))
 
@@ -1027,6 +1121,12 @@ for variablecode,variable in variables.items():
             for i in range(maxbernstein):
                 plt.plot(kbernstein*lengthnorm, omegabernstein[:,i]/freqnorm, color="white", linestyle=":")
 
+        if ibw is not None and (componentnames is scalarcomponentnames or componentnames[c] == "x"):
+            for i in range(ibw.shape[1]):
+                plt.plot( kibw*lengthnorm, ibw[:,i]/freqnorm, color="white", linestyle="-.", linewidth=0.7,
+                          label=("IBW" if i == 0 else None))
+                plt.plot(-kibw*lengthnorm, ibw[:,i]/freqnorm, color="white", linestyle="-.", linewidth=0.7)
+
         if geometry == "perpendicular":
             comp = componentnames[c]
             # E along B0 carries the O mode; E_x and the other transverse component carry the X mode
@@ -1042,9 +1142,9 @@ for variablecode,variable in variables.items():
                           label="$O$" if have_latex else "O")
                 plt.plot(-kOdense*lengthnorm, wdense/freqnorm, color="magenta", linestyle="--", linewidth=0.9)
 
-        if show_lccl_curve:
-            plt.plot(kx*lengthnorm, lccl_numerical_omega(kx, dx, dt, wp, theta)/freqnorm, color="white", linestyle="--", linewidth=0.8,
-                     label=(r"LCCL, $\theta=$"+"{:g}".format(theta)) if have_latex else "LCCL, theta={:g}".format(theta))
+        if show_ap_curve:
+            plt.plot(kx*lengthnorm, ap_numerical_omega(kx, dx, dt, wp, theta)/freqnorm, color="white", linestyle="--", linewidth=0.8,
+                     label=(r"AP, $\theta=$"+"{:g}".format(theta)) if have_latex else "AP, theta={:g}".format(theta))
 
         if Wci > 0.:
             plt.axhline(Wci/freqnorm, color="cyan", linestyle=":", linewidth=0.5, label=r"$\Omega_{ci}$" if have_latex else "W_ci")
@@ -1072,6 +1172,13 @@ for variablecode,variable in variables.items():
         else:
             #plt.ylim(   0., w[-1]/freqnorm)
             plt.ylim(   0.,  3.*wpe/freqnorm)
+
+        # colour range from the maximum inside the visible region
+        visible = power[np.ix_((w/freqnorm >= plt.ylim()[0]) & (w/freqnorm <= plt.ylim()[1]),
+                               (kx*lengthnorm >= plt.xlim()[0]) & (kx*lengthnorm <= plt.xlim()[1]))]
+        if visible.size > 0 and np.amax(visible) > 0.:
+            vmax = np.ceil(np.log10(np.amax(visible)))
+            im.set_clim(vmax - args.cbrange, vmax)
 
         if args.legend_loc != "none":
             plt.legend(loc=args.legend_loc)

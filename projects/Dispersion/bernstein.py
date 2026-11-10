@@ -1,8 +1,11 @@
 """
-Dispersion relation of the electrostatic electron Bernstein modes propagating
-exactly perpendicular to B0, electron terms only, ions stationary based onxi
-Eq.  (51) of P. Kilian, P. A. Munoz, C. Schreiner, F. Spanier,
+Electrostatic Bernstein modes propagating exactly perpendicular to B0, for the reference curves of Dispersion.py.
+
+Electron Bernstein modes (bernstein_root_in_bracket, find_bernstein_mode_branch): electron terms only, ions
+stationary, based on Eq. (51) of P. Kilian, P. A. Munoz, C. Schreiner, F. Spanier,
 "Plasma Waves as a Benchmark Problem", arXiv:1611.01127
+
+Ion Bernstein modes (ion_bernstein_bands): both species kinetic, see that function.
 
     1 - (2 * Wce^2) / (k^2 * lambda_D^2) * exp(-lambda_e)
           * sum_{n=1}^{infty} n^2 * I_n(lambda_e) / (omega^2 - n^2 * Wce^2) = 0
@@ -170,3 +173,55 @@ def find_bernstein_mode_branch(i, kmax, Wce, lambda_D, r_e, ksamples=200, order=
         for k in k_values
     ])
     return k_values, omega_values
+
+
+def ion_bernstein_bands(k_values, nbands, Wci, Wce, r_i, r_e, lambda_Di, lambda_De):
+    """
+    Ion Bernstein modes: electrostatic, exactly perpendicular to B0, ions and electrons both kinetic
+    (Stix 1992, Ch. 11),
+
+        1 + sum_s 2 / (k^2 lambda_Ds^2) * sum_{n=1}^{infty} (n W_s)^2 exp(-lambda_s) I_n(lambda_s)
+                                                          / ((n W_s)^2 - omega^2) = 0,
+
+    lambda_s = k^2 r_s^2, r_s = v_th,s / W_s, lambda_Ds the Debye length of species s. This is Eq. (51)
+    with the ion term added; the electron term, which is all of Eq. (51), reduces to the electron
+    polarisation w_pe^2/W_ce^2 at ion frequencies but is kept in full. Between two ion harmonics the
+    left-hand side runs from -infinity to +infinity, so band n (n*Wci < omega < (n+1)*Wci) holds exactly
+    one root, found here by bisection for all bands at once. For w_pi >> W_ci band n runs from (n+1)*Wci
+    at small k r_i towards n*Wci at large k r_i.
+
+    Parameters
+    ----------
+    k_values : Perpendicular wavenumbers (nonzero).
+    nbands : Number of bands n = 1 .. nbands.
+    Wci, Wce : Ion and electron gyro frequencies
+    r_i, r_e : Ion and electron gyro radii
+    lambda_Di, lambda_De : Ion and electron Debye lengths
+
+    Returns
+    -------
+    omega [len(k_values), nbands]; NaN where the bracket cannot be resolved (negligible coupling of
+    that band at that k).
+    """
+    bands = np.arange(1, nbands + 1, dtype=float)
+    out = np.full((len(k_values), nbands), np.nan)
+    for ik, k in enumerate(k_values):
+        terms = []
+        for W, r, lD in ((Wci, r_i, lambda_Di), (Wce, r_e, lambda_De)):
+            n = np.arange(1, int(6.0 * k * r) + 31, dtype=float)   # exp(-b) I_n(b) negligible beyond a few k r
+            terms.append((2.0 / (k * lD) ** 2, (n * W) ** 2, ive(n, (k * r) ** 2)))
+
+        def lhs(w):
+            total = np.ones_like(w)
+            for pref, nW2, G in terms:
+                total += pref * np.sum(nW2 * G / (nW2 - w[:, None] ** 2), axis=1)
+            return total
+
+        lo, hi = bands * Wci * (1.0 + 1e-9), (bands + 1.0) * Wci * (1.0 - 1e-9)
+        ok = (lhs(lo) < 0.0) & (lhs(hi) > 0.0)
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            below = lhs(mid) < 0.0
+            lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+        out[ik] = np.where(ok, 0.5 * (lo + hi), np.nan)
+    return out
