@@ -74,6 +74,10 @@ namespace projects {
 
    class Project {
     public:
+      /*! Rescale popID in cell to getCorrectNumberDensity, e.g. after the initial removal of
+          blocks below minValue. Returns false, and does nothing, if the project defines no
+          correct density (rescalesDensity() is false). */
+      bool rescaleToCorrectDensity(spatial_cell::SpatialCell* cell, const uint popID) const;
       Project();
       virtual ~Project();
       

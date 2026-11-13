@@ -68,6 +68,7 @@ uint P::zcells_ini = numeric_limits<uint>::max();
 Real P::t = 0;
 Real P::t_min = 0;
 Real P::t_max = LARGE_REAL;
+bool P::restoreDensityAfterSparsification = false;
 Real P::dt_ceil = -1.0;
 Real P::dt = 0;
 Real P::vlasovSolverMaxCFL = 0.99;
@@ -414,6 +415,11 @@ bool P::addParameters() {
    RP::add("gridbuilder.dt_ceil",
            "Maximum simulation dt in seconds.",
            P::dt_ceil);
+   RP::add("gridbuilder.restoreDensityAfterSparsification",
+           "Rescale every species' initial distribution, after the initial removal of blocks below minValue, to the density "
+           "the project prescribes (Project::rescaleToCorrectDensity) or, where it does not, to the density it was filled with. "
+           "With kinetic electrons the unequal truncation of the species is otherwise a net charge",
+           P::restoreDensityAfterSparsification);
 
    // Field solver parameters
    RP::add("fieldsolver.method", "Method to compute fields, default LDZ", P::fieldSolverMethod);

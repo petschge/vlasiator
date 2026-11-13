@@ -88,6 +88,25 @@ void writeVelMesh(const dccrg::Dccrg<SpatialCell, dccrg::Cartesian_Geometry>& mp
    ++counter;
 }
 
+// Sum of f over the velocity mesh of popID, per cell. All blocks share one velocity-cell
+// volume, so it cancels in the before/after ratio used below.
+static std::vector<double> sumOfF(dccrg::Dccrg<SpatialCell,dccrg::Cartesian_Geometry>& mpiGrid,
+                                  const std::vector<CellID>& cells, const uint popID) {
+   std::vector<double> sums(cells.size(), 0.0);
+#ifndef USE_GPU
+   #pragma omp parallel for schedule(static)
+   for (size_t i = 0; i < cells.size(); ++i) {
+      SpatialCell* cell = mpiGrid[cells[i]];
+      const Realf* data = cell->get_data(popID);
+      const size_t n = (size_t)cell->get_number_of_velocity_blocks(popID) * WID3;
+      double s = 0.0;
+      for (size_t k = 0; k < n; ++k) { s += data[k]; }
+      sums[i] = s;
+   }
+#endif
+   return sums;
+}
+
 void initializeGrids(
    int argn,
    char **argc,
@@ -288,8 +307,33 @@ void initializeGrids(
          mpiGrid[cells[i]]->parameters[CellParams::LBWEIGHTCOUNTER] = 0;
       }
 
+#ifdef USE_GPU
+      if (P::restoreDensityAfterSparsification) {
+         bailout(true, "gridbuilder.restoreDensityAfterSparsification is only implemented for CPU builds", __FILE__, __LINE__);
+      }
+#endif
       for (uint popID = 0; popID < getObjectWrapper().particleSpecies.size(); ++popID) {
+         // Ions and electrons lose different fractions to the minValue cut (and to the block
+         // search before the fill); with kinetic electrons that difference is a net charge.
+         // Each species is set to the project's analytic density, or to its filled density.
+         const std::vector<double> filledSum = P::restoreDensityAfterSparsification
+            ? sumOfF(mpiGrid, cells, popID) : std::vector<double>();
          adjustVelocityBlocks(mpiGrid, cells, true, popID);
+         if (P::restoreDensityAfterSparsification) {
+            const std::vector<double> keptSum = sumOfF(mpiGrid, cells, popID);
+#ifndef USE_GPU
+            #pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < cells.size(); ++i) {
+               SpatialCell* cell = mpiGrid[cells[i]];
+               if (cell->sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY || keptSum[i] <= 0.0) { continue; }
+               if (project.rescaleToCorrectDensity(cell, popID)) { continue; }
+               const Realf factor = (Realf)(filledSum[i] / keptSum[i]);
+               Realf* data = cell->get_data(popID);
+               const size_t n = (size_t)cell->get_number_of_velocity_blocks(popID) * WID3;
+               for (size_t k = 0; k < n; ++k) { data[k] *= factor; }
+            }
+#endif
+         }
          // set initial LB metric based on number of blocks
          #pragma omp parallel for schedule(static)
          for (size_t i = 0; i < cells.size(); ++i) {

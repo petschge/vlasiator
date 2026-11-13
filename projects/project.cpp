@@ -240,6 +240,12 @@ namespace projects {
    /** Check if the project wants to rescale densities.
     * @param popID ID of the particle species.
     * @return If true, rescaleDensity is called for this species.*/
+   bool Project::rescaleToCorrectDensity(spatial_cell::SpatialCell* cell, const uint popID) const {
+      if (!rescalesDensity(popID)) { return false; }
+      rescaleDensity(cell, popID);
+      return true;
+   }
+
    bool Project::rescalesDensity(const uint popID) const {
       return false;
    }

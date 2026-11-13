@@ -55,6 +55,8 @@ struct Parameters {
    static Real dt;    /*!< The value of the timestep to use in propagation. If CflLimit defined then it is dynamically
                          updated during simulation*/
    static Real dt_ceil; /*!< The maximum value of the timestep to use in propagation. */
+   static bool restoreDensityAfterSparsification; /*!< Rescale each species' initial VDF after the initial
+                                               removal of blocks below minValue to the density it was filled with. */
 
    static Real vlasovSolverMaxCFL;   /*!< The maximum CFL limit for propagation of distribution function. Used to set
                                         timestep if useCFLlimit is true. */
