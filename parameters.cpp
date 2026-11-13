@@ -148,6 +148,7 @@ bool P::lcclOutflowAbsorbing = false;
 bool P::lcclInflowCharacteristic = false;
 uint P::lcclLowPassFilterOrder = 2;
 bool P::lcclGaussOutflowNeumann = false;
+bool P::lcclOpenBoundaryZeroGradient = false;
 bool P::lcclMatchedCurrent = false;
 bool P::lcclGaussConsistent = true;
 uint P::lcclGaussOrder = 7;
@@ -433,6 +434,7 @@ bool P::addParameters() {
    RP::add("fieldsolver.inflowCharacteristic", "LCCL solver: on an x- Maxwellian face impose the incoming characteristics (Ey+c*Bz = c*Bz_file, Ez-c*By = -c*By_file) and take the outgoing ones from the interior, instead of pinning B and E=0", P::lcclInflowCharacteristic);
    RP::add("fieldsolver.lowPassFilterOrder", "LCCL solver: order of the Shapiro low-pass filter (even, >= 2; 2 is the 3-point binomial). Higher orders remove the cell-to-cell mode with less smoothing of longer features", P::lcclLowPassFilterOrder);
    RP::add("fieldsolver.gaussLawOutflowNeumann", "LCCL solver: in the Gauss correction, zero normal gradient of phi at faces into Outflow cells instead of phi = 0, so the potential at an open end floats", P::lcclGaussOutflowNeumann);
+   RP::add("fieldsolver.openBoundaryZeroGradient", "LCCL solver: Outflow and Maxwellian cells take E from the neighbour one layer further in (in the E solve, after the low-pass filter and after the Gauss correction) instead of the boundary condition's E = 0, except components set by outflowAbsorbing or inflowCharacteristic; the Gauss correction has zero flux through Maxwellian faces and keeps phi = 0 on Outflow cells. Pinning E = 0 next to the centred interior stencils leaves charge in the last interior cells that no field can neutralise. Overrides gaussLawOutflowNeumann", P::lcclOpenBoundaryZeroGradient);
    RP::add("fieldsolver.matchedCurrent", "LCCL solver: predict the current at t^{k+theta} with the exact Lorentz push over dt that the Vlasov acceleration performs, J^{k+theta} = (1-theta) J* + theta J^{k+1}, instead of the implicit push of Liu et al. (alpha_s). Removes the instability of theta = 0.5 at large Omega_c dt; requires Omega_c dt < pi for every species", P::lcclMatchedCurrent);
    RP::add("fieldsolver.gaussLawConsistent", "LCCL solver: Gauss correction whose divergence matches the translation, which moves charge with the exact wavenumber: centred difference times a series in the compact second difference (fieldsolver.gaussLawOrder terms). The correction potential is low-pass filtered with fieldsolver.gaussLawFilterPasses binomial passes per axis; the system matrix and the gradient are those of Eq. 45. The centred operators of Eq. 45 make short Langmuir waves grow on coarse grids; this form does not. Near sharp plasma edges see fieldsolver.gaussLawFilterBarrier and fieldsolver.gaussLawUniformityRatio. Costs ceil((n-1)/2) + ceil(m/2) extra ghost exchanges per step (plus the mask) in any number of dimensions. Default on; 0 restores Eq. 45 as written", P::lcclGaussConsistent);
    RP::add("fieldsolver.gaussLawOrder", "LCCL solver: number of terms n of the series in fieldsolver.gaussLawConsistent (1..8; 1 is the centred difference of Eq. 45)", P::lcclGaussOrder);

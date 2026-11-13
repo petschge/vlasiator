@@ -361,6 +361,88 @@ static void lccl_PrepareInflowCharacteristic(std::span<const ApVec3> Ek, std::sp
 }
 
 /* ============================================================
+ * Section 1c: zero-gradient open faces (fieldsolver.openBoundaryZeroGradient)
+ * ============================================================
+ * Outflow and Maxwellian cells take E from the neighbour one layer further in,
+ * in the E solve, after the filter and after the Gauss correction. The Gauss
+ * correction has no flux through Maxwellian faces instead of phi = 0 there, and
+ * keeps phi = 0 on Outflow cells as its anchor.
+ * Pinning E = 0 and phi = 0 next to the centred interior stencils leaves charge
+ * in the last interior cells that no field can neutralise; with kinetic
+ * electrons it grew at the inflow face until the electrons there reached the
+ * velocity-space wall. Transverse components set by outflowAbsorbing or
+ * inflowCharacteristic keep those conditions. Tested in 1D along x.
+ */
+static bool lccl_IsOpenBoundary(cuint sysBoundaryFlag) {
+   return P::lcclOpenBoundaryZeroGradient
+      && (sysBoundaryFlag == sysboundarytype::OUTFLOW || sysBoundaryFlag == sysboundarytype::MAXWELLIAN);
+}
+
+// Gauss correction: no flux into the inflow (Maxwellian) face, phi = 0 on Outflow cells.
+// With every face zero-flux, a net charge in the domain has no field to drive it out and
+// the required mean subtraction acts as a uniform background that grows with the domain.
+static bool lccl_IsZeroFluxBoundary(cuint sysBoundaryFlag) {
+   return P::lcclOpenBoundaryZeroGradient && sysBoundaryFlag == sysboundarytype::MAXWELLIAN;
+}
+
+static bool lccl_OutflowAbsorbingActive(FieldSolverGrid& fsgrid) {
+   const auto g = fsgrid.getGlobalSize();
+   return P::lcclOutflowAbsorbing && g[1] == 1 && g[2] == 1;  // same test as lccl_SolveElectricField
+}
+
+// False where a transverse component of an open cell is set by a more specific condition.
+static bool lccl_ZeroGradientComp(cuint sysBoundaryFlag, size_t lid, int comp, bool outflowAbsorbingActive) {
+   if (comp == 0) { return true; }
+   if (outflowAbsorbingActive && sysBoundaryFlag == sysboundarytype::OUTFLOW) { return false; }
+   if (lcclInflow && lcclInflow->active[lid]) { return false; }
+   return true;
+}
+
+static const int lcclFaceOffsets[6][3] = {{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1}};
+
+// Index into lcclFaceOffsets of the neighbour one layer closer to the interior, or -1.
+static int lccl_InwardFace(const fsgrid::FsStencil& stencil, fsgrids::technicalspan technical, cuint sysBoundaryLayer) {
+   for (int f = 0; f < 6; ++f) {  // an interior neighbour wins over a boundary one
+      const int* o = lcclFaceOffsets[f];
+      if (!stencil.cellExists(o[0], o[1], o[2])) { continue; }
+      if (technical[stencil.indexFromOffset(o[0], o[1], o[2])].sysBoundaryFlag == sysboundarytype::NOT_SYSBOUNDARY) { return f; }
+   }
+   if (sysBoundaryLayer < 2) { return -1; }
+   for (int f = 0; f < 6; ++f) {
+      const int* o = lcclFaceOffsets[f];
+      if (!stencil.cellExists(o[0], o[1], o[2])) { continue; }
+      const auto& t = technical[stencil.indexFromOffset(o[0], o[1], o[2])];
+      if (t.sysBoundaryFlag != sysboundarytype::DO_NOT_COMPUTE && t.sysBoundaryFlag != sysboundarytype::OUTER_BOUNDARY_PADDING
+          && t.sysBoundaryLayer == (int)sysBoundaryLayer - 1) { return f; }
+   }
+   return -1;
+}
+
+// Zero-gradient fill, innermost layer first so that layer 2 copies a filled layer 1.
+static void lccl_CopyInwardToOpenBoundary(std::span<ApVec3> field, fsgrids::technicalspan technical, FieldSolverGrid& fsgrid) {
+   if (!P::lcclOpenBoundaryZeroGradient) { return; }
+   const bool absorbing = lccl_OutflowAbsorbingActive(fsgrid);
+   for (uint layer = 1; layer <= 2; ++layer) {
+      fsgrid.serial_for(
+         [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+         phiprof::initializeTimer("LCCL: zero-gradient open boundary"), technical,
+         [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+             cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+            if (!lccl_IsOpenBoundary(sysBoundaryFlag) || sysBoundaryLayer != layer) { return; }
+            const int f = lccl_InwardFace(stencil, technical, sysBoundaryLayer);
+            if (f < 0) { return; }
+            const int* o = lcclFaceOffsets[f];
+            const size_t lid = stencil.ooo();
+            const size_t n = stencil.indexFromOffset(o[0], o[1], o[2]);
+            for (int comp = 0; comp < 3; ++comp) {
+               if (lccl_ZeroGradientComp(sysBoundaryFlag, lid, comp, absorbing)) { field[lid][comp] = field[n][comp]; }
+            }
+         });
+      fsgrid.updateGhostCells(field);
+   }
+}
+
+/* ============================================================
  * Section 2: alpha_s / mu / J-hat  (Eqs. 35-37), evaluated at the nodes
  * ============================================================ */
 
@@ -697,7 +779,21 @@ bool lccl_SolveElectricField(
             // goes through the real dispatch below, even on an Outflow
             // cell with the absorbing condition active for comp 1 and 2.
             SBC::SysBoundaryCondition* bc = sysBoundaries.getSysBoundary(sysBoundaryFlag);
+            const int inward = lccl_IsOpenBoundary(sysBoundaryFlag) ? lccl_InwardFace(stencil, technical, sysBoundaryLayer) : -1;
             for (int comp = 0; comp < 3; ++comp) {
+               if (inward >= 0 && lccl_ZeroGradientComp(sysBoundaryFlag, lid, comp, outflowAbsorbingActive)) {
+                  // E_b - E_inward = 0
+                  const int* o = lcclFaceOffsets[inward];
+                  const HYPRE_BigInt row = globalDof(lid, comp);
+                  HYPRE_BigInt cols[2] = {row, globalDof(stencil.indexFromOffset(o[0], o[1], o[2]), comp)};
+                  HYPRE_Real vals[2] = {1.0, -1.0};
+                  HYPRE_Int two = 2;
+                  const HYPRE_Real zero = 0.0, x0 = (HYPRE_Real)Ek[lid][comp];
+                  HYPRE_IJMatrixSetValues(Aij, 1, &two, &row, cols, vals);
+                  HYPRE_IJVectorSetValues(bij, 1, &row, &zero);
+                  HYPRE_IJVectorSetValues(xij, 1, &row, &x0);
+                  continue;
+               }
                if (useAbsorbing && comp == 1) {
                   Etheta[lid][1] = c * Bk[lid][2];
                   Ekp1[lid][1]   = c * Bk[lid][2];
@@ -809,10 +905,13 @@ bool lccl_SolveElectricField(
          // Boundary-flagged cells (uncomputed or genuine) were already fully
          // pinned, both arrays, during assembly above -- Eq. 40 is only
          // valid for an interior cell's own E^k, not a value sourced from a
-         // boundary condition or held at 0 by convention.
-         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
+         // boundary condition or held at 0 by convention. Open cells
+         // (openBoundaryZeroGradient) were solved with E_b = E_inward and take Eq. 40 too.
+         const bool openZG = lccl_IsOpenBoundary(sysBoundaryFlag) && lccl_InwardFace(stencil, technical, sysBoundaryLayer) >= 0;
+         if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY && !openZG) { return; }
          const size_t lid = stencil.ooo();
          for (int comp = 0; comp < 3; ++comp) {
+            if (openZG && !lccl_ZeroGradientComp(sysBoundaryFlag, lid, comp, outflowAbsorbingActive)) { continue; }  // pinned in assembly
             const HYPRE_BigInt row = globalDof(lid, comp);
             HYPRE_Real val;
             HYPRE_IJVectorGetValues(xij, 1, &row, &val);
@@ -1227,6 +1326,8 @@ void lccl_GaussLawCorrection(
    double meanRhoOverEps = 0.0;
    bool useOutflowNeumann = false;
    double nInteriorGlobal = 0.0;
+   long long pinDof = 0;  // regularisation row without an anchor; dof 0 when fully periodic
+   std::vector<char> equationRow(nlocal, 0);  // rows that hold Eq. 45, for the RHS mean below
    bool hasAnchorGlobal = false;  // true if any boundary-flagged (Dirichlet-pinned) cell exists anywhere
    bool hasPinnedNonOutflow = false;
    {
@@ -1263,18 +1364,22 @@ void lccl_GaussLawCorrection(
       // for the single-rank runs this is being debugged with; for a
       // multi-rank run, read it as "the worst cell on rank 0" specifically.
       double maxAbsRhoOverEps_local = 0.0, xAtMax_local = 0.0;
+      long long firstInteriorDof_local = std::numeric_limits<long long>::max();
       fsgrid.serial_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
          phiprof::initializeTimer("LCCL: compute mean(rho)"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
             if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) {
+               if (lccl_IsZeroFluxBoundary(sysBoundaryFlag)) { return; }  // zero-flux face, not phi = 0
                hasAnchor_local = true;
                if (sysBoundaryFlag != sysboundarytype::OUTFLOW
                    && sysBoundaryFlag != sysboundarytype::DO_NOT_COMPUTE
                    && sysBoundaryFlag != sysboundarytype::OUTER_BOUNDARY_PADDING) { hasPinnedNonOutflow_local = true; }
                return;
             }
+            firstInteriorDof_local = std::min(firstInteriorDof_local,
+               dofOffset + (long long)(stencil.i + lx*((long long)stencil.j + ly*stencil.k)));
             const Real rhoOverEpsHere = rho[stencil.ooo()][0] / physicalconstants::EPS_0;
             sumRho_local += rhoOverEpsHere;
             nInterior_local += 1.0;
@@ -1288,10 +1393,12 @@ void lccl_GaussLawCorrection(
       MPI_Allreduce(&nInterior_local, &nInteriorGlobal, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
       MPI_Allreduce(&hasAnchor_local, &hasAnchorGlobal, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
       MPI_Allreduce(&hasPinnedNonOutflow_local, &hasPinnedNonOutflow, 1, MPI_C_BOOL, MPI_LOR, MPI_COMM_WORLD);
+      MPI_Allreduce(&firstInteriorDof_local, &pinDof, 1, MPI_LONG_LONG, MPI_MIN, MPI_COMM_WORLD);
       meanRhoOverEps = hasAnchorGlobal ? 0.0 : (sumRho_global / nInteriorGlobal);
-      // with every pinned cell behind a zero-flux face the system would be singular
-      useOutflowNeumann = P::lcclGaussOutflowNeumann && hasPinnedNonOutflow;
-      if (P::lcclGaussOutflowNeumann && !hasPinnedNonOutflow) {
+      // with every pinned cell behind a zero-flux face the system would be singular;
+      // openBoundaryZeroGradient sets its own faces (zero flux at Maxwellian, phi = 0 at Outflow)
+      useOutflowNeumann = P::lcclGaussOutflowNeumann && hasPinnedNonOutflow && !P::lcclOpenBoundaryZeroGradient;
+      if (P::lcclGaussOutflowNeumann && !hasPinnedNonOutflow && !P::lcclOpenBoundaryZeroGradient) {
          bailout(true, "fieldsolver.gaussLawOutflowNeumann needs a boundary other than Outflow to pin phi",
                  __FILE__, __LINE__);
       }
@@ -1423,10 +1530,11 @@ void lccl_GaussLawCorrection(
          // czz terms explicitly are just above -- so where mu varies between neighbouring
          // cells (it does, sharply, near either Harris sheet), the coefficient from cell A to
          // cell B generally differs from B back to A.
-         if (!hasAnchorGlobal && dofOffset + lidx == 0) {
+         if (!hasAnchorGlobal && dofOffset + lidx == pinDof) {
             mvals[nStencil*lidx + 0] = 1.0; // bvals[lidx] already 0.0 by default-init, same as above
             return;
          }
+         equationRow[lidx] = 1;
 
          const auto& m = mu[lid];
          double* mv = &mvals[nStencil*lidx];
@@ -1459,12 +1567,13 @@ void lccl_GaussLawCorrection(
          Real cxx_faceM = 0.5*(cxx_here+cxx_xm), cxx_faceP = 0.5*(cxx_here+cxx_xp);
          Real cyy_faceM = 0.5*(cyy_here+cyy_ym), cyy_faceP = 0.5*(cyy_here+cyy_yp);
          Real czz_faceM = 0.5*(czz_here+czz_zm), czz_faceP = 0.5*(czz_here+czz_zp);
-         if (useOutflowNeumann) {
+         if (useOutflowNeumann || P::lcclOpenBoundaryZeroGradient) {
             // no correction flux into an open end: the potential there floats instead of being
             // pinned to the other wall's, which would return any sheath potential step through
             // the vacuum gaps as uniform fields
             const auto outflow = [&](bool exists, size_t n) {
-               return exists && technical[n].sysBoundaryFlag == sysboundarytype::OUTFLOW;
+               return exists && ((useOutflowNeumann && technical[n].sysBoundaryFlag == sysboundarytype::OUTFLOW)
+                                 || lccl_IsZeroFluxBoundary(technical[n].sysBoundaryFlag));
             };
             if (outflow(hasXm, lidXm)) { cxx_faceM = 0.0; }
             if (outflow(hasXp, lidXp)) { cxx_faceP = 0.0; }
@@ -1509,6 +1618,22 @@ void lccl_GaussLawCorrection(
             bvals[lidx] = gaussResidView[lid][0] - (hasAnchorGlobal ? 0.0 : (useMaskedMean ? maskedResidualMean : meanRhoOverEps));
          }
       });
+
+   if (P::lcclOpenBoundaryZeroGradient && !hasAnchorGlobal) {
+      // Only zero-flux faces: the operator annihilates constants, so the whole RHS, not only
+      // rho, must have zero mean. What remains is the uniform part of the residual, which an
+      // open domain has no boundary to put into a field.
+      double sum_local = 0.0, n_local = 0.0, sum_global = 0.0, n_global = 0.0;
+      for (long long c = 0; c < nlocal; ++c) {
+         if (equationRow[c]) { sum_local += bvals[c]; n_local += 1.0; }
+      }
+      MPI_Allreduce(&sum_local, &sum_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      MPI_Allreduce(&n_local, &n_global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+      const double meanRhs = (n_global > 0.0) ? sum_global/n_global : 0.0;
+      for (long long c = 0; c < nlocal; ++c) {
+         if (equationRow[c]) { bvals[c] -= meanRhs; }
+      }
+   }
 
    // Hand mvals/bvals to HYPRE via IJ, using dofBase for global row/column indices
    HYPRE_IJMatrix Aij;
@@ -1638,15 +1763,16 @@ void lccl_GaussLawCorrection(
          phiGrid[stencil.ooo()][0] = phiLocal[lidx];
       });
    fsgrid.updateGhostCells(phiGrid.view());
-   if (useOutflowNeumann) {
-      // zero normal gradient: an Outflow cell takes phi of the nearest interior cell, so the
-      // centred gradient at the last interior node sees no step into the boundary
+   if (useOutflowNeumann || P::lcclOpenBoundaryZeroGradient) {
+      // zero normal gradient: an Outflow cell (gaussLawOutflowNeumann) or a Maxwellian cell
+      // (openBoundaryZeroGradient) takes phi of the nearest interior cell, so the centred
+      // gradient at the last interior node sees no step into the boundary
       fsgrid.serial_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
          phiprof::initializeTimer("LCCL: mirror phi into Outflow cells"), technical,
          [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
              cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
-            if (sysBoundaryFlag != sysboundarytype::OUTFLOW) { return; }
+            if (!(useOutflowNeumann && sysBoundaryFlag == sysboundarytype::OUTFLOW) && !lccl_IsZeroFluxBoundary(sysBoundaryFlag)) { return; }
             for (int dist = 1; dist <= FS_STENCIL_WIDTH; ++dist) {
                for (int axis = 0; axis < 3; ++axis) {
                   for (int sgn = -1; sgn <= 1; sgn += 2) {
@@ -2007,6 +2133,17 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    // FIXME: This is also how the timestep limit of the fieldsolver gets to the
    // rest of the code, but what ARE the timestep limits?
    if (dt == 0.0) {
+      int rankForLog = 0;
+      MPI_Comm_rank(MPI_COMM_WORLD, &rankForLog);
+      if (rankForLog == MASTER_RANK) {  // so that every log records which options were in effect
+         fprintf(stderr, "lccl_propagateFields: theta=%g enforceGaussLaw=%d gaussLawConsistent=%d lowPassFilter=%d "
+                 "lowPassFilterOrder=%u openBoundaryZeroGradient=%d outflowAbsorbing=%d gaussLawOutflowNeumann=%d "
+                 "inflowCharacteristic=%d matchedCurrent=%d\n",
+                 (double)P::FieldSolverTheta, P::lcclEnforceGaussLaw ? 1 : 0, P::lcclGaussConsistent ? 1 : 0,
+                 P::lcclLowPassFilter ? 1 : 0, (unsigned)P::lcclLowPassFilterOrder,
+                 P::lcclOpenBoundaryZeroGradient ? 1 : 0, P::lcclOutflowAbsorbing ? 1 : 0,
+                 P::lcclGaussOutflowNeumann ? 1 : 0, P::lcclInflowCharacteristic ? 1 : 0, P::lcclMatchedCurrent ? 1 : 0);
+      }
       fsgrid.parallel_for(
          [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
          phiprof::initializeTimer("LCCL: initial half-step Yee arrays"), technical,
@@ -2092,6 +2229,9 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
    if (P::lcclLowPassFilter) {
       lccl_ApplyLowPassFilter3D(Etheta.view(), technical, fsgrid);
       lccl_ApplyLowPassFilter3D(Ekp1.view(), technical, fsgrid);
+      // the filter leaves boundary cells alone, so they would lag the filtered interior
+      lccl_CopyInwardToOpenBoundary(Etheta.view(), technical, fsgrid);
+      lccl_CopyInwardToOpenBoundary(Ekp1.view(), technical, fsgrid);
    }
 
    // Step (2c): B^{k+1} from Eq. (23), B^{k+theta} from Eq. (39)
@@ -2133,6 +2273,7 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
             rho[lid][0] = sum;
          });
       lccl_GaussLawCorrection(Ekp1.view(), state.E.view(), rho.view(), mu.view(), technical, fsgrid, dt);
+      lccl_CopyInwardToOpenBoundary(Ekp1.view(), technical, fsgrid);
       gaussTimer.stop();
    }
 
