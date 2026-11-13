@@ -75,6 +75,10 @@ namespace projects {
       // Interpolate between up- and downstream quantities
       // based on position
       Real interpolate(Real u, Real d, Real x) const;
+      bool rescalesDensity(const uint popID) const override { return true; }
+      Real getCorrectNumberDensity(spatial_cell::SpatialCell* cell, const uint popID) const override;
+      // Bulk velocity shared by all species at position x (see IPShock.cpp)
+      std::array<Real, 3> plasmaVelocity(creal x) const;
 
       // Upstream bulk values
       Real B0u[3];

@@ -150,11 +150,12 @@ namespace projects {
          If we're in the dHT frame, phi_B and phi_V should be the same, and also the same
          both in the upstream and in the downstream.
       */
-      this->Bucosphi = abs(this->B0u[1])/this->B0utangential;   
-      this->Bdcosphi = abs(this->B0d[1])/this->B0dtangential;   
+      // 0/0 for a field-aligned (theta_Bn = 0) setup would put NaN into By
+      this->Bucosphi = (this->B0utangential > 0.0) ? abs(this->B0u[1])/this->B0utangential : 1.0;
+      this->Bdcosphi = (this->B0dtangential > 0.0) ? abs(this->B0d[1])/this->B0dtangential : 1.0;
       for(auto& sP : speciesParams) {
-         sP.Vucosphi = abs(sP.V0u[1])/sP.V0utangential;
-         sP.Vdcosphi = abs(sP.V0d[1])/sP.V0dtangential;
+         sP.Vucosphi = (sP.V0utangential > 0.0) ? abs(sP.V0u[1])/sP.V0utangential : 1.0;
+         sP.Vdcosphi = (sP.V0dtangential > 0.0) ? abs(sP.V0d[1])/sP.V0dtangential : 1.0;
       }
 
       /* Save signs as well for reconstruction during interpolation.
@@ -226,7 +227,6 @@ namespace projects {
       ) const {
       const IPShockSpeciesParameters& sP = this->speciesParams[popID];
       const Real mass = getObjectWrapper().particleSpecies[popID].mass;
-      const Real mu0 = physicalconstants::MU_0;
       // Fetch spatial cell center coordinates
       const Real x  = cell->parameters[CellParams::XCRD] + 0.5*cell->parameters[CellParams::DX];
       const Real y  = cell->parameters[CellParams::YCRD] + 0.5*cell->parameters[CellParams::DY];
@@ -239,18 +239,10 @@ namespace projects {
          std::cout<<"density too low! "<<DENSITY<<" x "<<x<<" y "<<y<<" z "<<z<<std::endl;
       }
     
-      // Solve tangential components for B and V
-      Real hereVX = sP.DENSITYu * sP.V0u[0] / DENSITY;
-      Real hereBX = this->B0u[0];
-      Real MAsq = std::pow((sP.V0u[0]/this->B0u[0]), 2) * sP.DENSITYu * mass * mu0;
-      Real hereBtang = this->B0u[2] * (MAsq - 1.0)/(MAsq*hereVX/sP.V0u[0] -1.0);
-      Real hereVtang = hereVX * hereBtang / hereBX;
-
-      /* Reconstruct Y and Z components using cos(phi) values and signs. Tangential variables are always positive. */
-      //Real hereBY = hereBtang * this->Bucosphi * this->Byusign;
-      //Real hereBZ = hereBtang * sqrt(1. - this->Bucosphi * this->Bucosphi) * this->Bzusign;
-      Real hereVY = abs(hereVtang) * sP.Vucosphi * sP.Vyusign;
-      Real hereVZ = abs(hereVtang) * sqrt(1. - sP.Vucosphi * sP.Vucosphi) * sP.Vzusign;
+      const std::array<Real, 3> hereV = plasmaVelocity(x);
+      const Real hereVX = hereV[0];
+      const Real hereVY = hereV[1];
+      const Real hereVZ = hereV[2];
 
       // Old incorrect temperature - just interpolate for now
       //Real adiab = 5./3.;
@@ -314,19 +306,15 @@ namespace projects {
       const Real y  = cell->parameters[CellParams::YCRD] + 0.5*cell->parameters[CellParams::DY];
       const Real z  = cell->parameters[CellParams::ZCRD] + 0.5*cell->parameters[CellParams::DZ];
 
-      const Real mu0 = physicalconstants::MU_0;
       const Real mass = getObjectWrapper().particleSpecies[popID].mass;
       Real DENSITY = interpolate(sP.DENSITYu,sP.DENSITYd, x);
       if (DENSITY < 1e-20) {
          std::cout<<"density too low! "<<DENSITY<<" x "<<x<<" y "<<y<<" z "<<z<<std::endl;
       }
-      Real hereVX = sP.DENSITYu * sP.V0u[0] / DENSITY;
-      Real hereBX = this->B0u[0];
-      Real MAsq = std::pow((sP.V0u[0]/this->B0u[0]), 2) * sP.DENSITYu * mass * mu0;
-      Real hereBtang = this->B0u[2] * (MAsq - 1.0)/(MAsq*hereVX/sP.V0u[0] -1.0);
-      Real hereVtang = hereVX * hereBtang / hereBX;
-      Real hereVY = abs(hereVtang) * sP.Vucosphi * sP.Vyusign;
-      Real hereVZ = abs(hereVtang) * sqrt(1. - sP.Vucosphi * sP.Vucosphi) * sP.Vzusign;
+      const std::array<Real, 3> hereV = plasmaVelocity(x);
+      const Real hereVX = hereV[0];
+      const Real hereVY = hereV[1];
+      const Real hereVZ = hereV[2];
       Real TEMPERATURE = interpolate(sP.TEMPERATUREu,sP.TEMPERATUREd, x);
       Real initRho = DENSITY;
       Real initT = TEMPERATURE;
@@ -341,40 +329,43 @@ namespace projects {
       return value;
    }
    
-   std::vector<std::array<Real, 3>> IPShock::getV0(creal x, creal y, creal z, const uint popID) const {
-      Real mass = getObjectWrapper().particleSpecies[popID].mass;
-      Real mu0 = physicalconstants::MU_0;
+   // Same profile and cell-centre x as fillPhaseSpace, so species stay neutral after sparsification.
+   Real IPShock::getCorrectNumberDensity(spatial_cell::SpatialCell* cell, const uint popID) const {
       const IPShockSpeciesParameters& sP = this->speciesParams[popID];
+      const Real x = cell->parameters[CellParams::XCRD] + 0.5*cell->parameters[CellParams::DX];
+      return interpolate(sP.DENSITYu, sP.DENSITYd, x);
+   }
 
-      // Interpolate density between upstream and downstream
-      // All other values are calculated from jump conditions
-      Real DENSITY = interpolate(sP.DENSITYu,sP.DENSITYd, x);
-      if (DENSITY < 1e-20) {
-         std::cout<<"density too low! "<<DENSITY<<" x "<<x<<" y "<<y<<" z "<<z<<std::endl;
-      }
-    
-      // Solve tangential components for B and V
-      Real VX = sP.DENSITYu * sP.V0u[0] / DENSITY;
-      Real BX = this->B0u[0];
-      Real MAsq = std::pow((sP.V0u[0]/this->B0u[0]), 2) * sP.DENSITYu * mass * mu0;
-      Real Btang = this->B0utangential * (MAsq - 1.0)/(MAsq*VX/sP.V0u[0] -1.0);
-      Real Vtang = VX * Btang / BX;
-
-      /* Reconstruct Y and Z components using cos(phi) values and signs. Tangential variables are always positive. */
-      //Real BY = Btang * this->Bucosphi * this->Byusign;
-      //Real BZ = Btang * sqrt(1. - this->Bucosphi * this->Bucosphi) * this->Bzusign;
-      Real VY = abs(Vtang) * sP.Vucosphi * sP.Vyusign;
-      Real VZ = abs(Vtang) * sqrt(1. - sP.Vucosphi * sP.Vucosphi) * sP.Vzusign;
-
-      // Disable compiler warnings: (unused variables but the function is inherited)
+   std::vector<std::array<Real, 3>> IPShock::getV0(creal x, creal y, creal z, const uint popID) const {
       (void)y;
       (void)z;
-    
-      std::array<Real, 3> V0 {{VX, VY, VZ}};
-      std::vector<std::array<Real, 3>> retval;
-      retval.push_back(V0);
+      (void)popID;
+      return {plasmaVelocity(x)};
+   }
 
-      return retval;
+   /* Every species gets the same bulk velocity: the MHD jump condition for
+      the tangential field involves the total mass density, and per-species
+      flows that differ would carry a current through the uniform up- and
+      downstream states. Mirrors setProjectBField so that V is parallel to B
+      (de Hoffmann-Teller frame) at every x. */
+   std::array<Real, 3> IPShock::plasmaVelocity(creal x) const {
+      Real massDensity = 0.0;
+      Real massDensityU = 0.0;
+      Real momentumU = 0.0;
+      for (uint i = 0; i < speciesParams.size(); i++) {
+         const IPShockSpeciesParameters& sP = speciesParams[i];
+         const Real mass = getObjectWrapper().particleSpecies[i].mass;
+         massDensity += mass * interpolate(sP.DENSITYu, sP.DENSITYd, x);
+         massDensityU += mass * sP.DENSITYu;
+         momentumU += mass * sP.DENSITYu * sP.V0u[0];
+      }
+      const Real Vu0 = momentumU / massDensityU;
+      const Real VX = momentumU / massDensity;
+      const Real MAsq = std::pow(Vu0 / this->B0u[0], 2) * massDensityU * physicalconstants::MU_0;
+      const Real Btang = this->B0utangential * (MAsq - 1.0) / (MAsq * VX / Vu0 - 1.0);
+      const Real BY = abs(Btang) * this->Bucosphi * this->Byusign;
+      const Real BZ = abs(Btang) * sqrt(1. - this->Bucosphi * this->Bucosphi) * this->Bzusign;
+      return {VX, VX * BY / this->B0u[0], VX * BZ / this->B0u[0]};
    }
 
    void IPShock::calcCellParameters(spatial_cell::SpatialCell* cell, creal& t) { }
