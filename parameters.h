@@ -151,6 +151,7 @@ struct Parameters {
    static bool lcclInflowCharacteristic; /*!< LCCL solver: incident-wave (characteristic) condition on an x- Maxwellian face. */
    static uint lcclLowPassFilterOrder;   /*!< LCCL solver: order (even, >= 2) of the Shapiro low-pass filter. */
    static bool lcclGaussOutflowNeumann;  /*!< LCCL solver: floating phi at faces into Outflow cells in the Gauss correction. */
+   static bool lcclGaussLawCorrectsPushField; /*!< LCCL solver: also apply theta times the Gauss correction of E^{k+1} to E^{k+theta}, the field the Vlasov push uses. */
    static bool lcclOpenBoundaryZeroGradient; /*!< LCCL solver: zero-gradient E in Outflow/Maxwellian cells, zero-flux Maxwellian face and phi = 0 Outflow cells in the Gauss correction. */
    static bool lcclMatchedCurrent;       /*!< LCCL solver: predict J^{k+theta} with the exact Lorentz push the acceleration performs. */
    static bool lcclGaussConsistent;      /*!< LCCL solver: Gauss correction with a divergence consistent with the translation and a low-pass filtered potential (default); false restores Eq. 45. */

@@ -2137,11 +2137,11 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
       MPI_Comm_rank(MPI_COMM_WORLD, &rankForLog);
       if (rankForLog == MASTER_RANK) {  // so that every log records which options were in effect
          fprintf(stderr, "lccl_propagateFields: theta=%g enforceGaussLaw=%d gaussLawConsistent=%d lowPassFilter=%d "
-                 "lowPassFilterOrder=%u openBoundaryZeroGradient=%d outflowAbsorbing=%d gaussLawOutflowNeumann=%d "
-                 "inflowCharacteristic=%d matchedCurrent=%d\n",
+                 "lowPassFilterOrder=%u openBoundaryZeroGradient=%d gaussLawCorrectsPushField=%d outflowAbsorbing=%d "
+                 "gaussLawOutflowNeumann=%d inflowCharacteristic=%d matchedCurrent=%d\n",
                  (double)P::FieldSolverTheta, P::lcclEnforceGaussLaw ? 1 : 0, P::lcclGaussConsistent ? 1 : 0,
                  P::lcclLowPassFilter ? 1 : 0, (unsigned)P::lcclLowPassFilterOrder,
-                 P::lcclOpenBoundaryZeroGradient ? 1 : 0, P::lcclOutflowAbsorbing ? 1 : 0,
+                 P::lcclOpenBoundaryZeroGradient ? 1 : 0, P::lcclGaussLawCorrectsPushField ? 1 : 0, P::lcclOutflowAbsorbing ? 1 : 0,
                  P::lcclGaussOutflowNeumann ? 1 : 0, P::lcclInflowCharacteristic ? 1 : 0, P::lcclMatchedCurrent ? 1 : 0);
       }
       fsgrid.parallel_for(
@@ -2272,8 +2272,33 @@ bool lccl_propagateFields(fsgrids::perbspan perb,
             }
             rho[lid][0] = sum;
          });
+      // The push uses E^{k+theta}; by Eq. 40 its correction is theta times that of E^{k+1}. Without it, at
+      // large omega_pe dt the correction reaches the particles only through E^k, damped by mu in Eq. 38.
+      ApNodeField EuncorrectedKp1(nStorage);
+      if (P::lcclGaussLawCorrectsPushField) {
+         const auto src = Ekp1.view();
+         std::copy(src.begin(), src.end(), EuncorrectedKp1.view().begin());
+      }
       lccl_GaussLawCorrection(Ekp1.view(), state.E.view(), rho.view(), mu.view(), technical, fsgrid, dt);
       lccl_CopyInwardToOpenBoundary(Ekp1.view(), technical, fsgrid);
+      if (P::lcclGaussLawCorrectsPushField) {
+         const auto before = EuncorrectedKp1.view();
+         const auto after = Ekp1.view();
+         auto Et = Etheta.view();
+         fsgrid.parallel_for(
+            [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
+            phiprof::initializeTimer("LCCL: Gauss correction of E^(k+theta)"), technical,
+            [&](const fsgrid::Coordinates& coordinates, const fsgrid::FsStencil& stencil,
+                cuint sysBoundaryFlag, cuint sysBoundaryLayer) {
+               if (sysBoundaryFlag != sysboundarytype::NOT_SYSBOUNDARY) { return; }
+               const size_t lid = stencil.ooo();
+               for (int comp = 0; comp < 3; ++comp) {
+                  Et[lid][comp] += theta*(after[lid][comp] - before[lid][comp]);
+               }
+            });
+         fsgrid.updateGhostCells(Et);
+         lccl_CopyInwardToOpenBoundary(Et, technical, fsgrid);
+      }
       gaussTimer.stop();
    }
 
