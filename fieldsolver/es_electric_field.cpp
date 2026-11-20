@@ -4,9 +4,12 @@
 #include <HYPRE_sstruct_mv.h>
 #include <HYPRE_parcsr_ls.h>
 #include <HYPRE_krylov.h>
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 #include "es_poisson_periodic.hpp"
+#include "../object_wrapper.h"
 
 #ifdef DEBUG_VLASIATOR
 #define DEBUG_FSOLVER
@@ -140,40 +143,53 @@ void es_ElectrostaticPotential(fsgrids::potentialspan Phi,
    const int lz = localSize[2];
    const long long nlocal = (long long)lx * ly * lz;
 
-   std::vector<double> rho(nlocal, 0.0);
+   std::vector<double> rho(nlocal, 0.0), rhom(nlocal, 0.0);
    fsgrid.parallel_for(
       [](int timerId) -> phiprof::Timer { return phiprof::Timer{timerId}; },
       phiprof::initializeTimer("Extract net charge"),
       technical,
 
-      [&rho,moments,lx,ly]
+      [&rho,&rhom,moments,lx,ly]
       (const fsgrid::Coordinates &coordinates,
        const fsgrid::FsStencil& stencil,
        cuint sysBoundaryFlag,
        cuint sysBoundaryLayer
       ) {
          const long long lidx = stencil.i + lx*((long long)stencil.j + ly*stencil.k);
-         rho[lidx] = moments[stencil.ooo()][fsgrids::moments::RHOQ];
+         rho[lidx]  = moments[stencil.ooo()][fsgrids::moments::RHOQ];
+         rhom[lidx] = moments[stencil.ooo()][fsgrids::moments::RHOM];
       });
 
-   // Monitor charge neutrality: the mean of rho is subtracted below (in a periodic domain only the
-   // fluctuating part has a potential), but a large imbalance usually means a set-up error.
-   double sumRho_local = 0.0, sumAbsRho_local = 0.0;
-   for (long long li = 0; li < nlocal; ++li) {
-      sumRho_local    += rho[li];
-      sumAbsRho_local += std::abs(rho[li]);
+   // Monitor charge neutrality: the mean of rho is subtracted below (in a
+   // periodic domain only the fluctuating part has a potential), but a large
+   // imbalance usually means a set-up error. The imbalance is measured against
+   // the gross charge density sum_s |q_s| n_s, not against sum |rho|.
+   double qmMin = std::numeric_limits<double>::max();
+   for (const auto& species : getObjectWrapper().particleSpecies) {
+      if (species.mass > 0.0 && species.charge != 0.0) {
+         qmMin = std::min(qmMin, (double)std::abs(species.charge / species.mass));
+      }
    }
-   double reduceLocal[2]  = { sumRho_local, sumAbsRho_local };
-   double reduceGlobal[2] = { 0.0, 0.0 };
-   MPI_Allreduce(reduceLocal, reduceGlobal, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+   if (qmMin == std::numeric_limits<double>::max()) { qmMin = 0.0; }
+   double sumRho_local = 0.0, sumRhom_local = 0.0;
+   for (long long li = 0; li < nlocal; ++li) {
+      sumRho_local  += rho[li];
+      sumRhom_local += rhom[li];
+   }
+   double reduceLocal[3]  = { sumRho_local, sumRhom_local, (double)nlocal };
+   double reduceGlobal[3] = { 0.0, 0.0, 0.0 };
+   MPI_Allreduce(reduceLocal, reduceGlobal, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
    constexpr double neutralityWarnThreshold = 1e-3;
-   const double relativeImbalance = reduceGlobal[1] > 0.0 ? std::abs(reduceGlobal[0]) / reduceGlobal[1] : 0.0;
+   const double cellsGlobal = std::max(reduceGlobal[2], 1.0);
+   const double meanRho = reduceGlobal[0] / cellsGlobal;
+   const double grossRho = qmMin * reduceGlobal[1] / cellsGlobal;
+   const double relativeImbalance = grossRho > 0.0 ? std::abs(meanRho) / grossRho : 0.0;
    int myRank;
    MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
    if (relativeImbalance > neutralityWarnThreshold && myRank == MASTER_RANK) {
-      fprintf(stderr, "es_ElectrostaticPotential: net charge: sum(rho)=%e, relative imbalance |sum(rho)|/sum(|rho|)=%e "
-                      "(above %e); its mean is removed before the solve\n",
-              reduceGlobal[0], relativeImbalance, neutralityWarnThreshold);
+      fprintf(stderr, "es_ElectrostaticPotential: net charge: mean(rho)=%e C/m^3, %e of the charge density of the "
+                      "plasma (above %e); its mean is removed before the solve\n",
+              meanRho, relativeImbalance, neutralityWarnThreshold);
    }
 
    const std::array<long long,3> gsize = { (long long)globalSize[0], (long long)globalSize[1], (long long)globalSize[2] };
